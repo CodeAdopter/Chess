@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Cli/Cli.csproj" />
+  <Project Path="Core/Core.csproj" />
+  <Project Path="Engine/Engine.csproj" />
+  <Project Path="Tests/Tests.csproj" />
+</Solution>
