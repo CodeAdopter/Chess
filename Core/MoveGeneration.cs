@@ -264,11 +264,9 @@ public static class MoveGeneration
         ulong themPawns = pos.BitboardOf(themColor, PieceType.Pawn);
         ulong themKnights = pos.BitboardOf(themColor, PieceType.Knight);
 
-        // --- Phase 1: danger squares (everything the enemy attacks). The king may not move into these. ---
-        ulong danger = 0;
-
-        danger |= Tables.PawnAttacks(themColor, themPawns)
-               | Tables.KingAttacks(theirKing);
+        // danger squares (everything the enemy attacks). The king may not move into these.
+        ulong danger = Tables.PawnAttacks(themColor, themPawns)
+                     | Tables.KingAttacks(theirKing);
 
         b1 = themKnights;
         while (b1 != 0) danger |= Tables.KnightAttacks(Bitboard.PopLsb(ref b1));
@@ -277,14 +275,17 @@ public static class MoveGeneration
         // step back along the check ray). The king-removed occupancy is loop-invariant, so compute it once.
         ulong allNoKing = all ^ (1UL << (int)ourKing);
 
-        b1 = theirDiagSliders;
-        while (b1 != 0) danger |= Tables.GetBishopAttacks(Bitboard.PopLsb(ref b1), allNoKing);
+        ulong kingTargets = Tables.KingAttacks(ourKing) & ~usBb;
+        if (kingTargets != 0 || (castling != CastlingRights.None && AnyCastleCorridorClear(usColor, all, castling)))
+        {
+            b1 = theirDiagSliders;
+            while (b1 != 0) danger |= Tables.GetBishopAttacks(Bitboard.PopLsb(ref b1), allNoKing);
 
-        b1 = theirOrthSliders;
-        while (b1 != 0) danger |= Tables.GetRookAttacks(Bitboard.PopLsb(ref b1), allNoKing);
+            b1 = theirOrthSliders;
+            while (b1 != 0) danger |= Tables.GetRookAttacks(Bitboard.PopLsb(ref b1), allNoKing);
+        }
 
-        // --- Phase 2: king moves. A safe king target is adjacent, not onto our own piece, and not in danger. ---
-        b1 = Tables.KingAttacks(ourKing) & ~(usBb | danger);
+        b1 = kingTargets & ~danger;
         sink.Quiets(ourKing, b1 & ~themBb);
         sink.Captures(ourKing, b1 & themBb);
 
@@ -308,16 +309,14 @@ public static class MoveGeneration
         while (candidates != 0)
         {
             s = Bitboard.PopLsb(ref candidates);
-            b1 = Tables.SQUARES_BETWEEN_BB[(int)ourKing][(int)s] & usBb;
+            b1 = Tables.SQUARES_BETWEEN[((int)ourKing << 6) | (int)s] & usBb;
 
             if (b1 == 0)
-                checkers ^= Bitboard.SQUARE_BB[(int)s];   // nothing between: it's a checking slider
+                checkers ^= 1UL << (int)s;                // nothing between: it's a checking slider
             else if ((b1 & (b1 - 1)) == 0)
                 pinned ^= b1;                             // exactly one of our pieces between: it's pinned
         }
 
-        pos.Checkers = checkers;
-        pos.Pinned = pinned;
         ulong notPinned = ~pinned;
 
         // --- Phase 4: branch on how many pieces give check. ---
@@ -339,7 +338,7 @@ public static class MoveGeneration
                         // A checking pawn can itself be captured en passant (the rare case the EP pawn is the checker).
                         if (epsq != Square.NoSquare)
                         {
-                            var epTarget = Bitboard.SQUARE_BB[(int)epsq];
+                            var epTarget = 1UL << (int)epsq;
                             var southDir = Types.RelativeDir(usColor, Direction.South);
                             if (checkers == Bitboard.Shift(southDir, epTarget))
                             {
@@ -362,7 +361,7 @@ public static class MoveGeneration
                     {
                         // A sliding check can be answered by capturing the checker or blocking along the ray.
                         captureask = checkers;
-                        quietMask = Tables.SQUARES_BETWEEN_BB[(int)ourKing][(int)checkerSquare];
+                        quietMask = Tables.SQUARES_BETWEEN[((int)ourKing << 6) | (int)checkerSquare];
                         break;
                     }
                 }
@@ -415,20 +414,20 @@ public static class MoveGeneration
         b1 = b2 & notPinned;
         var southDir = Types.RelativeDir(usColor, Direction.South);
         var epCaptureSquare = (Square)((int)epsq + (int)southDir);
-        var epCaptureSquareBb = Bitboard.SQUARE_BB[(int)epCaptureSquare];
+        var epCaptureSquareBb = 1UL << (int)epCaptureSquare;
         var rankMask = Bitboard.MASK_RANK[(int)Types.RankOf(ourKing)];
 
         while (b1 != 0)
         {
             s = Bitboard.PopLsb(ref b1);
 
-            var newOcc = all ^ Bitboard.SQUARE_BB[(int)s] ^ epCaptureSquareBb;
+            var newOcc = all ^ (1UL << (int)s) ^ epCaptureSquareBb;
 
             if ((Tables.SlidingAttacks(ourKing, newOcc, rankMask) & theirOrthSliders) == 0)
                 sink.One(s, epsq, MoveFlags.EnPassant);
         }
 
-        b1 = b2 & pinned & Tables.LINE[(int)epsq][(int)ourKing];
+        b1 = b2 & pinned & Tables.LINE_BB[((int)epsq << 6) | (int)ourKing];
         if (b1 != 0)
         {
             sink.One(Bitboard.Bsf(b1), epsq, MoveFlags.EnPassant);
@@ -475,6 +474,20 @@ public static class MoveGeneration
     }
 
     /// <summary>
+    /// True if at least one castling corridor is clear
+    /// False if king is boxed in, no move can consume the slider danger map, so the per-node sweep that builds it is skipped.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool AnyCastleCorridorClear(Color us, ulong all, CastlingRights rights)
+    {
+        return us == Color.White
+            ? ((rights & CastlingRights.WhiteOO) != 0 && (all & 0x60UL) == 0)
+              || ((rights & CastlingRights.WhiteOOO) != 0 && (all & 0xeUL) == 0)
+            : ((rights & CastlingRights.BlackOO) != 0 && (all & 0x6000000000000000UL) == 0)
+              || ((rights & CastlingRights.BlackOOO) != 0 && (all & 0x0e00000000000000UL) == 0);
+    }
+
+    /// <summary>
     /// Generates moves for pinned pieces. A pinned piece may only move along the line between the king and the
     /// pinning piece, so every destination is intersected with <c>LINE[king][piece]</c>. A pinned knight can
     /// never move at all (it is excluded here), and pinned-pawn pushes/captures/promotions are handled inline.
@@ -494,7 +507,8 @@ public static class MoveGeneration
             s = Bitboard.PopLsb(ref b1);
             var pt = Types.TypeOf(pos.At(s));
             if (pt == PieceType.Pawn) continue;
-            b2 = Tables.Attacks(pt, s, all) & Tables.LINE[(int)ourKing][(int)s];
+            ulong line = Tables.LINE_BB[((int)ourKing << 6) | (int)s];
+            b2 = Tables.Attacks(pt, s, all) & line;
             sink.Quiets(s, b2 & quietMask);
             sink.Captures(s, b2 & captureask);
         }
@@ -504,26 +518,27 @@ public static class MoveGeneration
         {
             s = Bitboard.PopLsb(ref b1);
 
+            ulong line = Tables.LINE_BB[((int)ourKing << 6) | (int)s];
             if (Types.RankOf(s) == Types.RelativeRank(usColor, Rank.Rank7))
             {
-                b2 = Tables.PawnAttacks(usColor, s) & captureask & Tables.LINE[(int)ourKing][(int)s];
+                b2 = Tables.PawnAttacks(usColor, s) & captureask & line;
                 sink.PromoCaptures(s, b2);
 
                 var northDir = Types.RelativeDir(usColor, Direction.North);
-                b2 = Bitboard.Shift((Direction)northDir, Bitboard.SQUARE_BB[(int)s]) & ~all & Tables.LINE[(int)ourKing][(int)s];
+                b2 = Bitboard.Shift((Direction)northDir, 1UL << (int)s) & ~all & line;
                 sink.PromoQuiets(s, b2);
             }
             else
             {
-                b2 = Tables.PawnAttacks(usColor, s) & themBb & Tables.LINE[(int)ourKing][(int)s];
+                b2 = Tables.PawnAttacks(usColor, s) & themBb & line;
 
                 sink.Captures(s, b2);
 
                 var northDir = Types.RelativeDir(usColor, Direction.North);
-                b2 = Bitboard.Shift((Direction)northDir, Bitboard.SQUARE_BB[(int)s]) & ~all & Tables.LINE[(int)ourKing][(int)s];
+                b2 = Bitboard.Shift((Direction)northDir, 1UL << (int)s) & ~all & line;
 
                 b3 = Bitboard.Shift((Direction)northDir, b2 & Bitboard.MASK_RANK[(int)Types.RelativeRank(usColor, Rank.Rank3)])
-                   & ~all & Tables.LINE[(int)ourKing][(int)s];
+                   & ~all & line;
 
                 sink.Quiets(s, b2);
                 sink.DoublePushes(s, b3);
@@ -536,6 +551,7 @@ public static class MoveGeneration
     /// each restricted to <paramref name="captureask"/> for captures and <paramref name="quietMask"/> for
     /// quiet moves. Those masks already encode the "must block or capture the checker" rule under single check.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void HandleNonPinnedPiecesInto<TSink>(Color usColor, ulong usPawns, ulong usKnights,
         ulong usDiagSliders, ulong usOrthSliders, ulong notPinned, ulong all, ulong captureask, ulong quietMask,
         ref TSink sink) where TSink : IMoveSink, allows ref struct
@@ -579,6 +595,7 @@ public static class MoveGeneration
     /// forward direction, then each resulting destination bit is turned back into a from/to move. The "north"
     /// directions are taken relative to the side to move, so the same code serves both colours.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void HandleNonPinnedPawnsInto<TSink>(ulong usPawns, Color usColor, ulong notPinned,
         ulong all, ulong captureask, ulong quietMask, ref TSink sink) where TSink : IMoveSink, allows ref struct
     {

@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Core;
@@ -227,6 +229,29 @@ public class Position
         colorBB[((int)pc >> 3) & 1] &= ~bb;
         board[(int)s] = Piece.NoPiece;
     }
+
+    // Removes the piece on s when the caller already read it
+    private void RemovePieceKnownNoHash(Square s, Piece pc)
+    {
+        ulong bb = 1UL << (int)s;
+        pieceBB[(int)pc] &= ~bb;
+        colorBB[((int)pc >> 3) & 1] &= ~bb;
+        board[(int)s] = Piece.NoPiece;
+    }
+
+    // Capture move where the captured piece is already known
+    private void MovePieceKnownCaptureNoHash(Square from, Square to, Piece captured)
+    {
+        var movingPiece = board[(int)from];
+        ulong toBB = 1UL << (int)to;
+        ulong fromTo = (1UL << (int)from) | toBB;
+        pieceBB[(int)movingPiece] ^= fromTo;
+        colorBB[((int)movingPiece >> 3) & 1] ^= fromTo;
+        pieceBB[(int)captured] &= ~toBB;
+        colorBB[((int)captured >> 3) & 1] &= ~toBB;
+        board[(int)to] = movingPiece;
+        board[(int)from] = Piece.NoPiece;
+    }
     private void MovePieceNoHash(Square from, Square to)
     {
         var movingPiece = board[(int)from];
@@ -243,6 +268,7 @@ public class Position
         board[(int)to] = movingPiece;
         board[(int)from] = Piece.NoPiece;
     }
+    
     /// <summary>
     /// Deep-copies another position (board, bitboards, hash, and history up to the current ply) into a fresh independent instance.
     /// </summary>
@@ -277,11 +303,14 @@ public class Position
     /// <summary>
     /// The bitboard of all pieces of a specific coloured kind (e.g. white knights).
     /// </summary>
-    public ulong BitboardOf(Piece pc) => pieceBB[(int)pc];
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong BitboardOf(Piece pc) => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(pieceBB), (int)pc);
     /// <summary>
     /// The bitboard of all pieces of the given colour and type.
     /// </summary>
-    public ulong BitboardOf(Color c, PieceType pt) => pieceBB[(int)Types.MakePiece(c, pt)];
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong BitboardOf(Color c, PieceType pt) =>
+        Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(pieceBB), (int)Types.MakePiece(c, pt));
     /// <summary>
     /// The piece on a square, or <see cref="Piece.NoPiece"/> if empty.
     /// </summary>
@@ -313,25 +342,30 @@ public class Position
     /// <summary>
     /// The colour's bishops and queens (the pieces that attack along diagonals).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ulong DiagonalSliders(Color c)
     {
+        ref ulong pb = ref MemoryMarshal.GetArrayDataReference(pieceBB);
         return c == Color.White ?
-            pieceBB[(int)Piece.WhiteBishop] | pieceBB[(int)Piece.WhiteQueen] :
-            pieceBB[(int)Piece.BlackBishop] | pieceBB[(int)Piece.BlackQueen];
+            Unsafe.Add(ref pb, (int)Piece.WhiteBishop) | Unsafe.Add(ref pb, (int)Piece.WhiteQueen) :
+            Unsafe.Add(ref pb, (int)Piece.BlackBishop) | Unsafe.Add(ref pb, (int)Piece.BlackQueen);
     }
     /// <summary>
     /// The colour's rooks and queens (the pieces that attack along ranks and files).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ulong OrthogonalSliders(Color c)
     {
+        ref ulong pb = ref MemoryMarshal.GetArrayDataReference(pieceBB);
         return c == Color.White ?
-            pieceBB[(int)Piece.WhiteRook] | pieceBB[(int)Piece.WhiteQueen] :
-            pieceBB[(int)Piece.BlackRook] | pieceBB[(int)Piece.BlackQueen];
+            Unsafe.Add(ref pb, (int)Piece.WhiteRook) | Unsafe.Add(ref pb, (int)Piece.WhiteQueen) :
+            Unsafe.Add(ref pb, (int)Piece.BlackRook) | Unsafe.Add(ref pb, (int)Piece.BlackQueen);
     }
     /// <summary>
     /// The cached occupancy bitboard for a colour (all of its pieces).
     /// </summary>
-    public ulong AllPieces(Color c) => colorBB[(int)c];
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong AllPieces(Color c) => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(colorBB), (int)c);
 
     /// <summary>
     /// The set of pieces of colour <paramref name="c"/> that attack square <paramref name="s"/> under
@@ -586,7 +620,8 @@ public class Position
 
         // Perft needs only Castling/Epsq/Captured in the undo record (not Hash/HalfMoveClock), so set those
         // three directly instead of constructing+copying a full UndoInfo from the previous ply.
-        History[gamePly].Castling = History[gamePly - 1].Castling & ~(CastleClear[(int)from] | CastleClear[(int)to]);
+        ref CastlingRights cc = ref MemoryMarshal.GetArrayDataReference(CastleClear);
+        History[gamePly].Castling = History[gamePly - 1].Castling & ~(Unsafe.Add(ref cc, (int)from) | Unsafe.Add(ref cc, (int)to));
         History[gamePly].Epsq = Square.NoSquare;
         History[gamePly].Captured = Piece.NoPiece;
 
@@ -624,25 +659,39 @@ public class Position
                 RemovePieceNoHash(from); PutPieceNoHash(Types.MakePiece(us, PieceType.Queen), to);
                 break;
             case MoveFlags.PcKnight:
-                RemovePieceNoHash(from); History[gamePly].Captured = board[(int)to];
-                RemovePieceNoHash(to); PutPieceNoHash(Types.MakePiece(us, PieceType.Knight), to);
-                break;
+                {
+                    Piece cap = board[(int)to]; History[gamePly].Captured = cap;
+                    RemovePieceNoHash(from); RemovePieceKnownNoHash(to, cap);
+                    PutPieceNoHash(Types.MakePiece(us, PieceType.Knight), to);
+                    break;
+                }
             case MoveFlags.PcBishop:
-                RemovePieceNoHash(from); History[gamePly].Captured = board[(int)to];
-                RemovePieceNoHash(to); PutPieceNoHash(Types.MakePiece(us, PieceType.Bishop), to);
-                break;
+                {
+                    Piece cap = board[(int)to]; History[gamePly].Captured = cap;
+                    RemovePieceNoHash(from); RemovePieceKnownNoHash(to, cap);
+                    PutPieceNoHash(Types.MakePiece(us, PieceType.Bishop), to);
+                    break;
+                }
             case MoveFlags.PcRook:
-                RemovePieceNoHash(from); History[gamePly].Captured = board[(int)to];
-                RemovePieceNoHash(to); PutPieceNoHash(Types.MakePiece(us, PieceType.Rook), to);
-                break;
+                {
+                    Piece cap = board[(int)to]; History[gamePly].Captured = cap;
+                    RemovePieceNoHash(from); RemovePieceKnownNoHash(to, cap);
+                    PutPieceNoHash(Types.MakePiece(us, PieceType.Rook), to);
+                    break;
+                }
             case MoveFlags.PcQueen:
-                RemovePieceNoHash(from); History[gamePly].Captured = board[(int)to];
-                RemovePieceNoHash(to); PutPieceNoHash(Types.MakePiece(us, PieceType.Queen), to);
-                break;
+                {
+                    Piece cap = board[(int)to]; History[gamePly].Captured = cap;
+                    RemovePieceNoHash(from); RemovePieceKnownNoHash(to, cap);
+                    PutPieceNoHash(Types.MakePiece(us, PieceType.Queen), to);
+                    break;
+                }
             case MoveFlags.Capture:
-                History[gamePly].Captured = board[(int)to];
-                MovePieceNoHash(from, to);
-                break;
+                {
+                    Piece cap = board[(int)to]; History[gamePly].Captured = cap;
+                    MovePieceKnownCaptureNoHash(from, to, cap);
+                    break;
+                }
         }
     }
 

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 
 namespace Core;
@@ -12,6 +13,10 @@ namespace Core;
 /// </summary>
 public static class Tables
 {
+    // File masks
+    private const ulong NotFileA = 0xfefefefefefefefeUL;
+    private const ulong NotFileH = 0x7f7f7f7f7f7f7f7fUL;
+
     // On CPUs with fast BMI2 (Intel Haswell+, AMD Zen3+) the slider index is a single PEXT instruction
     // (occ -> packed relevant-bits index) instead of the magic multiply+shift, and the per-square table is
     // sized to exactly 2^relevantBits, both smaller (better cache) and cheaper to index. Lookups branch
@@ -240,9 +245,12 @@ public static class Tables
     {
         int sq = (int)square;
         ulong mask = ROOK_ATTACK_MASKS[sq];
-        if (Bmi2.X64.IsSupported)
-            return ROOK_ATTACKS[ROOK_BASE[sq] + (int)Bmi2.X64.ParallelBitExtract(occ, mask)];
-        return ROOK_ATTACKS[ROOK_BASE[sq] + (int)(((occ & mask) * ROOK_MAGICS[sq]) >> ROOK_ATTACK_SHIFTS[sq])];
+        // Base + index is in [base, base + 2^popcount(mask)) is always valid
+        // ROOK_ATTACKS slot; skip array bounds via Unsafe.Add.
+        int idx = Bmi2.X64.IsSupported
+            ? ROOK_BASE[sq] + (int)Bmi2.X64.ParallelBitExtract(occ, mask)
+            : ROOK_BASE[sq] + (int)(((occ & mask) * ROOK_MAGICS[sq]) >> ROOK_ATTACK_SHIFTS[sq]);
+        return Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(ROOK_ATTACKS), idx);
     }
 
     /// <summary>
@@ -356,19 +364,21 @@ public static class Tables
     {
         int sq = (int)square;
         ulong mask = BISHOP_ATTACK_MASKS[sq];
-        if (Bmi2.X64.IsSupported)
-            return BISHOP_ATTACKS[BISHOP_BASE[sq] + (int)Bmi2.X64.ParallelBitExtract(occ, mask)];
-        return BISHOP_ATTACKS[BISHOP_BASE[sq] + (int)(((occ & mask) * BISHOP_MAGICS[sq]) >> BISHOP_ATTACK_SHIFTS[sq])];
+        // Skip array bounds via Unsafe.Add
+        int idx = Bmi2.X64.IsSupported
+            ? BISHOP_BASE[sq] + (int)Bmi2.X64.ParallelBitExtract(occ, mask)
+            : BISHOP_BASE[sq] + (int)(((occ & mask) * BISHOP_MAGICS[sq]) >> BISHOP_ATTACK_SHIFTS[sq]);
+        return Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(BISHOP_ATTACKS), idx);
     }
 
     /// <summary>Direct knight/king pseudo-attack lookups that skip the <see cref="Attacks"/> guard+switch
     /// dispatch, for the move-generation hot path where the square is always valid.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong KnightAttacks(Square s) => PSEUDO_LEGAL_ATTACKS[(int)PieceType.Knight][(int)s];
+    public static ulong KnightAttacks(Square s) => KNIGHT_ATTACKS[(int)s];
 
     /// <inheritdoc cref="KnightAttacks"/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong KingAttacks(Square s) => PSEUDO_LEGAL_ATTACKS[(int)PieceType.King][(int)s];
+    public static ulong KingAttacks(Square s) => KING_ATTACKS[(int)s];
 
     /// <summary>
     /// X-ray bishop attacks: see <see cref="GetXrayRookAttacks"/>, but along diagonals.
@@ -386,6 +396,7 @@ public static class Tables
     /// square a pinned piece may still move along.
     /// </summary>
     public static readonly ulong[][] SQUARES_BETWEEN_BB = new ulong[64][];
+    public static readonly ulong[] SQUARES_BETWEEN = new ulong[64 * 64];
 
     /// <summary>
     /// Fills <see cref="SQUARES_BETWEEN_BB"/> by intersecting the two squares' slider attacks over a board occupied only by themselves.
@@ -401,10 +412,12 @@ public static class Tables
                 sqs = Bitboard.SQUARE_BB[(int)sq1] | Bitboard.SQUARE_BB[(int)sq2];
                 if (Types.FileOf(sq1) == Types.FileOf(sq2) || Types.RankOf(sq1) == Types.RankOf(sq2))
                     SQUARES_BETWEEN_BB[(int)sq1][(int)sq2] =
-                    GetRookAttacksForInit(sq1, sqs) & GetRookAttacksForInit(sq2, sqs);
+                    SQUARES_BETWEEN[((int)sq1 << 6) | (int)sq2] =
+                        GetRookAttacksForInit(sq1, sqs) & GetRookAttacksForInit(sq2, sqs);
                 else if (Types.DiagonalOf(sq1) == Types.DiagonalOf(sq2) || Types.AntiDiagonalOf(sq1) == Types.AntiDiagonalOf(sq2))
                     SQUARES_BETWEEN_BB[(int)sq1][(int)sq2] =
-                    GetBishopAttacksForInit(sq1, sqs) & GetBishopAttacksForInit(sq2, sqs);
+                    SQUARES_BETWEEN[((int)sq1 << 6) | (int)sq2] =
+                        GetBishopAttacksForInit(sq1, sqs) & GetBishopAttacksForInit(sq2, sqs);
             }
         }
     }
@@ -414,6 +427,7 @@ public static class Tables
     /// endpoints, or empty if they are not collinear. Used to keep a pinned piece moving along the pin ray.
     /// </summary>
     public static readonly ulong[][] LINE = new ulong[64][];
+    public static readonly ulong[] LINE_BB = new ulong[64 * 64];
 
     /// <summary>
     /// Fills <see cref="LINE"/> from the slider attacks of each square on an empty board, OR-ed with the two endpoints.
@@ -427,12 +441,14 @@ public static class Tables
             {
                 if (Types.FileOf(sq1) == Types.FileOf(sq2) || Types.RankOf(sq1) == Types.RankOf(sq2))
                     LINE[(int)sq1][(int)sq2] =
-                    GetRookAttacksForInit(sq1, 0) & GetRookAttacksForInit(sq2, 0)
-                    | Bitboard.SQUARE_BB[(int)sq1] | Bitboard.SQUARE_BB[(int)sq2];
+                    LINE_BB[((int)sq1 << 6) | (int)sq2] =
+                        GetRookAttacksForInit(sq1, 0) & GetRookAttacksForInit(sq2, 0)
+                        | Bitboard.SQUARE_BB[(int)sq1] | Bitboard.SQUARE_BB[(int)sq2];
                 else if (Types.DiagonalOf(sq1) == Types.DiagonalOf(sq2) || Types.AntiDiagonalOf(sq1) == Types.AntiDiagonalOf(sq2))
                     LINE[(int)sq1][(int)sq2] =
-                    GetBishopAttacksForInit(sq1, 0) & GetBishopAttacksForInit(sq2, 0)
-                    | Bitboard.SQUARE_BB[(int)sq1] | Bitboard.SQUARE_BB[(int)sq2];
+                    LINE_BB[((int)sq1 << 6) | (int)sq2] =
+                        GetBishopAttacksForInit(sq1, 0) & GetBishopAttacksForInit(sq2, 0)
+                        | Bitboard.SQUARE_BB[(int)sq1] | Bitboard.SQUARE_BB[(int)sq2];
             }
         }
     }
@@ -489,6 +505,7 @@ public static class Tables
     /// <paramref name="occ"/>. Returns empty for an invalid square. Pawns are asymmetric (they capture
     /// differently from how they move), so they are rejected here; use <see cref="PawnAttacks(Color, Square)"/>.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ulong Attacks(PieceType pt, Square s, ulong occ)
     {
         if (s == Square.NoSquare || (int)s >= 64)
@@ -507,20 +524,24 @@ public static class Tables
     /// <summary>
     /// The squares attacked by a whole set of pawns at once (used e.g. to compute the opponent's pawn-controlled squares), by shifting the pawn bitboard along both capture diagonals.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ulong PawnAttacks(Color c, ulong p)
     {
+        // Avoids the Bitboard.Shift Direction switch.(NW/NE for white, SW/SE for black)
         return c == Color.White ?
-            Bitboard.Shift(Direction.NorthWest, p) | Bitboard.Shift(Direction.NorthEast, p) :
-            Bitboard.Shift(Direction.SouthWest, p) | Bitboard.Shift(Direction.SouthEast, p);
+            ((p & NotFileA) << 7) | ((p & NotFileH) << 9) :
+            ((p & NotFileA) >> 9) | ((p & NotFileH) >> 7);
     }
 
     /// <summary>
     /// The squares a single pawn of colour <paramref name="c"/> on square <paramref name="s"/> attacks. Returns empty for <see cref="Square.NoSquare"/>.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ulong PawnAttacks(Color c, Square s)
     {
         if (s == Square.NoSquare)
             return 0;
-        return PAWN_ATTACKS[(int)c][(int)s];
+        // Index the per-colour span directly instead of the jagged PAWN_ATTACKS[c][s] double indirection.
+        return c == Color.White ? WHITE_PAWN_ATTACKS[(int)s] : BLACK_PAWN_ATTACKS[(int)s];
     }
 }
