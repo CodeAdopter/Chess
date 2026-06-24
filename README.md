@@ -11,13 +11,13 @@ CPU:  Intel Core i9-14900KF. (1 core)
 <!-- perftdoc:search:begin -->
 | Position | Depth | Nodes | NPS |
 |:--|--:|--:|--:|
-| Startpos | 6 | 119,060,324 | 519.91 Mnps |
-| Kiwipete | 5 | 193,690,690 | 686.85 Mnps |
+| Startpos | 6 | 119,060,324 | 543.65 Mnps |
+| Kiwipete | 5 | 193,690,690 | 691.75 Mnps |
 | Endgame | 6 | 11,030,083 | 424.23 Mnps |
 | Tactical | 5 | 15,833,292 | 510.75 Mnps |
-| Promotions | 5 | 89,941,194 | 624.59 Mnps |
-| Midgame | 5 | 164,075,551 | 661.59 Mnps |
-| **Total** | | **593,631,134** | **618.37 Mnps** |
+| Promotions | 5 | 89,941,194 | 628.96 Mnps |
+| Midgame | 5 | 164,075,551 | 672.44 Mnps |
+| **Total** | | **593,631,134** | **629.51 Mnps** |
 <!-- perftdoc:search:end -->
 
 ### Bulk-count perft (popcounts the last ply, perft-only and faster)
@@ -26,12 +26,12 @@ CPU:  Intel Core i9-14900KF. (1 core)
 | Position | Depth | Nodes | NPS |
 |:--|--:|--:|--:|
 | Startpos | 6 | 119,060,324 | 680.34 Mnps |
-| Kiwipete | 5 | 193,690,690 | 1335.80 Mnps |
+| Kiwipete | 5 | 193,690,690 | 1345.07 Mnps |
 | Endgame | 6 | 11,030,083 | 787.86 Mnps |
 | Tactical | 5 | 15,833,292 | 879.63 Mnps |
 | Promotions | 5 | 89,941,194 | 1124.26 Mnps |
-| Midgame | 5 | 164,075,551 | 1065.43 Mnps |
-| **Total** | | **593,631,134** | **1013.02 Mnps** |
+| Midgame | 5 | 164,075,551 | 1072.39 Mnps |
+| **Total** | | **593,631,134** | **1016.49 Mnps** |
 <!-- perftdoc:bulk:end -->
 
 ## Engine
