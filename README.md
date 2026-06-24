@@ -4,27 +4,35 @@ Chess engine with self-trained NNUE in C#.
 
 ## PERFT
 
-Throughput on Kiwipete depth 6 (8,031,647,685 nodes), Intel Core i9-14900KF.
+CPU:  Intel Core i9-14900KF.
 
-### Move generation (legal generator for search)
+### Move generation (the legal generator the search uses)
 
-| Threads | Nodes Per Second | Speedup |
-|---:|---:|---:|
-| 1  | 606 Million NPS   | 1.0×  |
-| 2  | 1.199 Billion NPS | 2.0×  |
-| 4  | 2.360 Billion NPS | 3.9×  |
-| 8  | 4.415 Billion NPS | 7.3×  |
-| 16 | 6.498 Billion NPS | 10.7× |
+<!-- perftdoc:search:begin -->
+| Position | Depth | Nodes | NPS |
+|:--|--:|--:|--:|
+| Startpos | 6 | 119,060,324 | 519.91 Mnps |
+| Kiwipete | 5 | 193,690,690 | 686.85 Mnps |
+| Endgame | 6 | 11,030,083 | 424.23 Mnps |
+| Tactical | 5 | 15,833,292 | 510.75 Mnps |
+| Promotions | 5 | 89,941,194 | 624.59 Mnps |
+| Midgame | 5 | 164,075,551 | 661.59 Mnps |
+| **Total** | | **593,631,134** | **618.37 Mnps** |
+<!-- perftdoc:search:end -->
 
-### Bulk-count perft 
+### Bulk-count perft (popcounts the last ply, perft-only and faster)
 
-| Threads | Nodes Per Second | Speedup |
-|---:|---:|---:|
-| 1  | 1.110 Billion NPS  | 1.0×  |
-| 2  | 2.210 Billion NPS  | 2.0×  |
-| 4  | 4.290 Billion NPS  | 3.9×  |
-| 8  | 7.820 Billion NPS  | 7.0×  |
-| 16 | 12.688 Billion NPS | 11.4× |
+<!-- perftdoc:bulk:begin -->
+| Position | Depth | Nodes | NPS |
+|:--|--:|--:|--:|
+| Startpos | 6 | 119,060,324 | 680.34 Mnps |
+| Kiwipete | 5 | 193,690,690 | 1335.80 Mnps |
+| Endgame | 6 | 11,030,083 | 787.86 Mnps |
+| Tactical | 5 | 15,833,292 | 879.63 Mnps |
+| Promotions | 5 | 89,941,194 | 1124.26 Mnps |
+| Midgame | 5 | 164,075,551 | 1065.43 Mnps |
+| **Total** | | **593,631,134** | **1013.02 Mnps** |
+<!-- perftdoc:bulk:end -->
 
 ## Engine
 

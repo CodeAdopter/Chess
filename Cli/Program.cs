@@ -74,6 +74,12 @@ switch (args[0].ToLowerInvariant())
     case "perftsuite":
         Commands.PerftSuite(I(1, 3));
         break;
+    case "perftsuitebulk":
+        Commands.PerftSuite(I(1, 3), bulk: true);
+        break;
+    case "perftdoc":
+        Commands.PerftDoc(I(1, 5));
+        break;
     case "perftscale":
         Commands.PerftScale(I(1, 0));
         break;

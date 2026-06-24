@@ -172,9 +172,17 @@ public static class Commands
 
     /// <summary>
     /// Run the standard perft suite, the single-core move-generation throughput benchmark (Mnps).
+    /// <paramref name="bulk"/> uses the bulk-count driver (popcounts leaves, perft-only) instead of the
+    /// emit path the search uses.
     /// </summary>
-    public static void PerftSuite(int runs) =>
-        Run("perftsuite", ct => Engine.Perft.Suite(runs, ct));
+    public static void PerftSuite(int runs, bool bulk = false) =>
+        Run(bulk ? "perftsuitebulk" : "perftsuite", ct => Engine.Perft.Suite(runs, bulk, ct));
+
+    /// <summary>
+    /// Regenerate the PERFT throughput tables in the README from a live run of both suite drivers.
+    /// </summary>
+    public static void PerftDoc(int runs) =>
+        Run("perftdoc", ct => PerftReadme.Update(runs, ct));
 
     /// <summary>
     /// Sweep thread counts to chart how perft scales across cores. <paramref name="bulk"/> times the

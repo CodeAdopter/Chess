@@ -13,6 +13,8 @@ public static class Paths
     public static string Models => Ensure(Path.Combine(Workspace, "models"));
     public static string Logs => Ensure(Path.Combine(Workspace, "logs"));
 
+    public static string Root => Directory.GetParent(Workspace)?.FullName ?? Environment.CurrentDirectory;
+
     static Paths()
     {
         Workspace = Find() ?? Path.Combine(Environment.CurrentDirectory, "workspace");

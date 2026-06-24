@@ -213,50 +213,58 @@ public static class Perft
         }
     }
 
-    /// <summary>
-    /// Representative move-generation throughput benchmark. Warms up the JIT/PGO, then runs a fixed
-    /// suite of standard perft positions (open, slider-heavy, tactical) best-of-<paramref name="runs"/>
-    /// to suppress GC/scheduling noise, verifying the node count each time. Reports an aggregate Mnps so
-    /// before/after movegen changes are compared on one stable, correctness-checked number.
-    /// </summary>
-    public static void Suite(int runs = 3, CancellationToken ct = default)
-    {
-        (string fen, int depth, long expected)[] positions =
-        [
-            (Fens.Startpos,   6, 119_060_324),
-            (Fens.Kiwipete,   5, 193_690_690),
-            (Fens.Endgame,    6, 11_030_083),
-            (Fens.Tactical,   5, 15_833_292),
-            (Fens.Promotions, 5, 89_941_194),
-            (Fens.Midgame,    5, 164_075_551),
-        ];
+    public readonly record struct SuiteResult(string Name, string Fen, int Depth, long Nodes, long Ms, bool Ok);
 
+    private static readonly (string name, string fen, int depth, long expected)[] SuitePositions =
+    [
+        ("Startpos",   Fens.Startpos,   6, 119_060_324),
+        ("Kiwipete",   Fens.Kiwipete,   5, 193_690_690),
+        ("Endgame",    Fens.Endgame,    6, 11_030_083),
+        ("Tactical",   Fens.Tactical,   5, 15_833_292),
+        ("Promotions", Fens.Promotions, 5, 89_941_194),
+        ("Midgame",    Fens.Midgame,    5, 164_075_551),
+    ];
+
+
+    public static List<SuiteResult> RunSuite(int runs, bool bulk, CancellationToken ct = default)
+    {
         var warm = new Position();
         Position.Set(Fens.Startpos, warm);
-        for (int i = 0; i < 3; i++) CountFast(warm, 5);
+        for (int i = 0; i < 3; i++) { if (bulk) CountBulk(warm, 5); else CountFast(warm, 5); }
 
-        Console.WriteLine($"perft suite  (best of {runs})");
-        long totalNodes = 0, totalMs = 0;
-        bool allOk = true;
-        foreach (var (fen, depth, expected) in positions)
+        var results = new List<SuiteResult>(SuitePositions.Length);
+        foreach (var (name, fen, depth, expected) in SuitePositions)
         {
-            if (ct.IsCancellationRequested) { Console.WriteLine("cancelled."); return; }
+            ct.ThrowIfCancellationRequested();
             var pos = new Position();
             Position.Set(fen, pos);
             long best = long.MaxValue, nodes = 0;
             for (int r = 0; r < runs; r++)
             {
-                if (ct.IsCancellationRequested) { Console.WriteLine("cancelled."); return; }
+                ct.ThrowIfCancellationRequested();
                 var sw = Stopwatch.StartNew();
-                nodes = CountFast(pos, depth);
+                nodes = bulk ? CountBulk(pos, depth) : CountFast(pos, depth);
                 sw.Stop();
                 if (sw.ElapsedMilliseconds < best) best = sw.ElapsedMilliseconds;
             }
-            bool ok = nodes == expected;
-            allOk &= ok;
-            totalNodes += nodes;
-            totalMs += best;
-            Console.WriteLine($"  {(ok ? "ok  " : "FAIL")} d{depth} {nodes,14:n0}  {best,6} ms  {Log.Nps(nodes, best),12}   {fen}");
+            results.Add(new SuiteResult(name, fen, depth, nodes, best, nodes == expected));
+        }
+        return results;
+    }
+
+    public static void Suite(int runs = 3, bool bulk = false, CancellationToken ct = default)
+    {
+        var results = RunSuite(runs, bulk, ct);
+
+        Console.WriteLine($"perft suite [{(bulk ? "bulk-count, perft-only" : "emit path, search uses this")}]  (best of {runs})");
+        long totalNodes = 0, totalMs = 0;
+        bool allOk = true;
+        foreach (var r in results)
+        {
+            totalNodes += r.Nodes;
+            totalMs += r.Ms;
+            allOk &= r.Ok;
+            Console.WriteLine($"  {(r.Ok ? "ok  " : "FAIL")} d{r.Depth} {r.Nodes,14:n0}  {r.Ms,6} ms  {Log.Nps(r.Nodes, r.Ms),12}   {r.Fen}");
         }
         Console.WriteLine($"  ---- total {totalNodes,14:n0} nodes  {totalMs,6} ms  {Log.Nps(totalNodes, totalMs),12}   [{(allOk ? "all correct" : "MISMATCH!")}]");
     }

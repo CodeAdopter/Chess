@@ -112,8 +112,10 @@ public static class Menu
               chess train     [cores] [depth] [iterations]  continuous self-improving training
               chess perft     [depth] [fen]
               chess perftsuite [runs]                       single-core movegen throughput (Mnps)
+              chess perftsuitebulk [runs]                   same suite, bulk-count driver (perft-only)
               chess perftscale [maxThreads]                 multi-core move-gen scaling sweep
               chess perftbulkscale [maxThreads]             multi-core bulk-count perft scaling sweep
+              chess perftdoc [runs]                         regenerate the README PERFT tables
               chess nps       [depth] | [net] [depth]
               chess gen       [out.trd] [games] [depth] [randomPlies] [seed] [threads]
               chess trainfile [data] [outNet] [epochs] [H] [lr] [lambda] [threads]
