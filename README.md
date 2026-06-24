@@ -4,7 +4,7 @@ Chess engine with self-trained NNUE in C#.
 
 ## PERFT
 
-CPU:  Intel Core i9-14900KF.
+CPU:  Intel Core i9-14900KF. (1 core)
 
 ### Move generation (the legal generator the search uses)
 
