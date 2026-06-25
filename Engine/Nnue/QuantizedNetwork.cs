@@ -140,21 +140,23 @@ public sealed class QuantizedNetwork
 
         ref short x0 = ref MemoryMarshal.GetReference(x);
         ref short w0 = ref MemoryMarshal.GetArrayDataReference(L1);
-        int vw = Vector256<short>.Count;   // 16 int16 lanes
 
         Span<short> a1 = stackalloc short[L1Out];
         for (int o = 0; o < L1Out; o++)
         {
             int baseo = o * TwoH, i = 0;
-            Vector256<int> acc = Vector256<int>.Zero;
-            for (; i <= TwoH - vw; i += vw)
+            Vector256<int> a = Vector256<int>.Zero, b = Vector256<int>.Zero, c = Vector256<int>.Zero, d = Vector256<int>.Zero;
+            for (; i <= TwoH - 64; i += 64)   // 4 independent madd chains
             {
-                var vx = Vector256.LoadUnsafe(ref x0, (nuint)i);
-                var vwt = Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i));
-                acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(vx, vwt));   // 16×16 → 8 int32 partial sums
+                a = Avx2.Add(a, Avx2.MultiplyAddAdjacent(Vector256.LoadUnsafe(ref x0, (nuint)i),        Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i))));
+                b = Avx2.Add(b, Avx2.MultiplyAddAdjacent(Vector256.LoadUnsafe(ref x0, (nuint)(i + 16)), Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i + 16))));
+                c = Avx2.Add(c, Avx2.MultiplyAddAdjacent(Vector256.LoadUnsafe(ref x0, (nuint)(i + 32)), Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i + 32))));
+                d = Avx2.Add(d, Avx2.MultiplyAddAdjacent(Vector256.LoadUnsafe(ref x0, (nuint)(i + 48)), Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i + 48))));
             }
-            int s = L1Bias[o] + Vector256.Sum(acc);
-            for (; i < TwoH; i++) s += x[i] * L1[baseo + i];              // tail (none when TwoH % 16 == 0)
+            for (; i <= TwoH - 16; i += 16)   // 16-wide remainder
+                a = Avx2.Add(a, Avx2.MultiplyAddAdjacent(Vector256.LoadUnsafe(ref x0, (nuint)i), Vector256.LoadUnsafe(ref w0, (nuint)(baseo + i))));
+            int s = L1Bias[o] + Vector256.Sum(Avx2.Add(Avx2.Add(a, b), Avx2.Add(c, d)));
+            for (; i < TwoH; i++) s += x[i] * L1[baseo + i];              // scalar tail
             a1[o] = Requantise(s);
         }
         return Output(a1);
