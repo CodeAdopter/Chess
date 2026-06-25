@@ -162,7 +162,16 @@ public sealed class QuantizedNetwork
 
     private void Clamp(short[] accStm, short[] accNon, Span<short> x)
     {
-        for (int i = 0; i < H; i++)
+        // Vectorize the int16 crelu clamp
+        var lo = Vector<short>.Zero;
+        var hi = new Vector<short>(QA);
+        int w = Vector<short>.Count, i = 0;
+        for (; i <= H - w; i += w)
+        {
+            Vector.Min(Vector.Max(new Vector<short>(accStm, i), lo), hi).CopyTo(x.Slice(i, w));
+            Vector.Min(Vector.Max(new Vector<short>(accNon, i), lo), hi).CopyTo(x.Slice(H + i, w));
+        }
+        for (; i < H; i++)
         {
             x[i] = (short)Math.Clamp((int)accStm[i], 0, QA);
             x[H + i] = (short)Math.Clamp((int)accNon[i], 0, QA);
