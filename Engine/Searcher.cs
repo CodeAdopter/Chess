@@ -8,9 +8,12 @@ public struct SearchLimits
 {
     public int MaxDepth;     // hard depth cap
     public long MoveTimeMs;  // 0 => no explicit move-time budget
+    public long MaxNodes;    // 0 => no explicit node budget
     public bool Infinite;    // search until told to stop
 
     public static SearchLimits Depth(int d) => new() { MaxDepth = d, Infinite = false };
+    public static SearchLimits Time(long ms) => new() { MoveTimeMs = ms, Infinite = false };
+    public static SearchLimits Nodes(long n) => new() { MaxNodes = n, Infinite = false };
 }
 
 /// <summary>
@@ -28,22 +31,53 @@ public sealed class Searcher(int ttSizeMb = 64)
     // The "sound stack" (move-choice preserving) defaults ON; disable an individual one with OPT_X=0.
     // SEE is redundant with DELTA, and LMR reduces effective search depth (a data-quality risk), so both default OFF.
     // Per-instance (not static) so an A/B match can run two differently-configured searchers in one process.
-    private bool optDelta = Environment.GetEnvironmentVariable("OPT_DELTA") != "0";  // quiescence delta pruning
-    private bool optSee   = Environment.GetEnvironmentVariable("OPT_SEE")   == "1";  // skip losing captures (SEE<0) in qsearch
-    private bool optRfp   = Environment.GetEnvironmentVariable("OPT_RFP")   != "0";  // reverse futility / static null move
-    private bool optQtt   = Environment.GetEnvironmentVariable("OPT_QTT")   != "0";  // quiescence TT probe/store cutoffs
-    private bool optLmr   = Environment.GetEnvironmentVariable("OPT_LMR")   == "1";  // late move reductions
-    private static readonly bool OptIncEval = Environment.GetEnvironmentVariable("OPT_INCEVAL") != "0";  // incremental HCE (bit-exact)
+    private bool optDelta = Environment.GetEnvironmentVariable("OPT_DELTA") != "0";                     // quiescence delta pruning
+    private bool optSee   = Environment.GetEnvironmentVariable("OPT_SEE")   == "1";                     // skip losing captures (SEE<0) in qsearch
+    private bool optRfp   = Environment.GetEnvironmentVariable("OPT_RFP")   != "0";                     // reverse futility / static null move
+    private bool optQtt   = Environment.GetEnvironmentVariable("OPT_QTT")   != "0";                     // quiescence TT probe/store cutoffs
+    private bool optLmr   = Environment.GetEnvironmentVariable("OPT_LMR")   == "1";                     // late move reductions
+    private bool optMainSee = Environment.GetEnvironmentVariable("OPT_MAIN_SEE") == "1";                // shallow losing-capture pruning
+    private bool optBadHist = Environment.GetEnvironmentVariable("OPT_BADHIST") == "1";                 // conservative bad-history pruning
+    private bool optImproving = Environment.GetEnvironmentVariable("OPT_IMPROVING") != "0";             // improving-aware RFP/LMP/futility/LMR margins
+    private bool optContHist  = Environment.GetEnvironmentVariable("OPT_CONTHIST")  != "0";             // continuation history + malus-decay quiet-history update
+    private bool optIir = Environment.GetEnvironmentVariable("OPT_IIR") != "0";                         // internal iterative reduction (promoted: depth-per-time win, like LMR; OPT_IIR=0 disables)
+    private static readonly bool OptIncEval = Environment.GetEnvironmentVariable("OPT_INCEVAL") != "0"; // bit-exact residual baseline cache
+
+    private bool optModern = Environment.GetEnvironmentVariable("OPT_MODERN") != "0";
 
     /// <summary>Override the per-search optimisation flags (for A/B strength matches). INCEVAL is excluded
     /// because it is bit-exact and never affects move choice, so it stays globally configured.</summary>
     public void SetOpts(bool delta, bool see, bool rfp, bool qtt, bool lmr)
     { optDelta = delta; optSee = see; optRfp = rfp; optQtt = qtt; optLmr = lmr; }
 
-    private const int DeltaMargin  = 200;   // cp slack for quiescence delta pruning
-    private const int RfpMaxDepth  = 3;     // only RFP at shallow nodes
-    private const int RfpMargin    = 80;    // cp per ply for RFP
-    private const int SeeKingValue = 10000; // king never voluntarily recaptures into a defended square
+    public void SetModern(bool on) => optModern = on;
+
+    public void SetHistory(bool improving, bool contHist)
+    { optImproving = improving; optContHist = contHist; }
+
+    public void SetIir(bool on) => optIir = on;
+
+    private bool UseLmr => optModern || optLmr;
+
+    private const int DeltaMargin  = 200;               // cp slack for quiescence delta pruning
+    private const int RfpMaxDepth  = 3;                 // legacy RFP depth cap
+    private const int RfpMaxDepthModern = 6;            // depth cap for reverse futility pruning
+    private const int RfpMargin    = 80;                // cp per ply for RFP
+    private const int SeeKingValue = 10000;             // king never voluntarily recaptures into a defended square
+    private const int ExtBudget    = 16;                // max plies a root-to-leaf path may gain from check extensions
+    private const int HistReduceBar = 4000;             // quiet-move history above which LMR reduces one ply less
+    private const int HistoryMax = 16384;               // bounded history saturation point
+    private const int BadHistoryMax = 4096;             // max score clamp bad move
+    private const int BadHistPruneDepth = 4;            // max depth bad history pruning is allowed
+    private const int BadHistPruneThreshold = -512;     // bad move score below -512 pruned
+    private const int MainSeePruneDepth = 5;            
+    private const int MainSeeMargin = 80;               // cp per remaining ply
+    private const int MoveKeyCount = 64 * 64;           // table size
+    private const int NoStaticEval = int.MinValue / 2;
+    // Late-move pruning
+    private static readonly int[] LmpCount = [0, 5, 8, 12, 18, 26, 36];
+    // At depth 1-2, a quiet move whose optimistic static eval can't reach alpha is skipped. 
+    private static readonly int[] FutMargin = [0, 120, 200];
 
     // LMR reduction table [depth, moveNumber], precomputed once (depends only on depth & move index).
     private static readonly int[,] LmrTable = BuildLmrTable();
@@ -58,10 +92,21 @@ public sealed class Searcher(int ttSizeMb = 64)
 
     private readonly TranspositionTable tt = new(ttSizeMb);
     private readonly int[][] history = [new int[64 * 64], new int[64 * 64]];
+    private readonly short[][] badHistory = [new short[MoveKeyCount], new short[MoveKeyCount]];
     private readonly Move[,] killers = new Move[MaxPly, 2];
+    private readonly Move[] counterMoves = new Move[64 * 64];
+    private readonly int[] evalStack = new int[MaxPly];
+    private readonly short[][] continuationHistory = new short[MoveKeyCount][]; // sparse [previous from-to][current from-to]
+
+    /// <summary>
+    /// Resize the transposition table
+    /// </summary>
+    public void SetHashSize(int mb) => tt.Resize(mb);
 
     private long nodes;
     private long deadline;
+    private long maxNodes;   // 0 => no budget
+    private int rootDepth;
     private bool infinite;
     private bool stop;
     private readonly Stopwatch clock = new();
@@ -85,6 +130,7 @@ public sealed class Searcher(int ttSizeMb = 64)
     public long LastQNodes { get; private set; }
     public long LastMs { get; private set; }
     public int LastScore { get; private set; }   // score (cp, side-to-move POV) of the last completed search
+    public int LastDepth { get; private set; }   // deepest fully-completed iteration of the last search
 
     /// <summary>
     /// Use an NNUE network (incrementally evaluated) for leaf eval; null reverts to hand-crafted.
@@ -105,10 +151,8 @@ public sealed class Searcher(int ttSizeMb = 64)
     {
         if (acc == null) return Eval.Evaluate(pos);
         int correction = acc.Evaluate(pos.Turn);
-        if (verify != null && correction != verify.Evaluate(pos)) VerifyMismatches++;
-        // OPT_INCEVAL: use the incrementally-maintained hand-crafted eval (bit-identical to Eval.Evaluate)
-        // instead of re-scanning all pieces every q-node. Pure speed; result is unchanged.
         int hc = OptIncEval ? acc.EvaluateHce(pos.Turn) : Eval.Evaluate(pos);
+        if (verify != null && (correction != verify.Evaluate(pos) || hc != Eval.Evaluate(pos))) VerifyMismatches++;
         return Math.Clamp(hc + correction, -10000, 10000);
     }
 
@@ -149,6 +193,11 @@ public sealed class Searcher(int ttSizeMb = 64)
         if (clearTt) tt.Clear();
         Array.Clear(history[0]);
         Array.Clear(history[1]);
+        Array.Clear(badHistory[0]);
+        Array.Clear(badHistory[1]);
+        Array.Clear(counterMoves);
+        for (int i = 0; i < continuationHistory.Length; i++)
+            if (continuationHistory[i] != null) Array.Clear(continuationHistory[i]);
     }
 
     /// <summary>
@@ -163,6 +212,7 @@ public sealed class Searcher(int ttSizeMb = 64)
         infinite = limits.Infinite;
         clock.Restart();
         deadline = limits.MoveTimeMs > 0 ? limits.MoveTimeMs : long.MaxValue;
+        maxNodes = limits.MaxNodes;
 
         Array.Clear(killers, 0, killers.Length);
 
@@ -175,14 +225,16 @@ public sealed class Searcher(int ttSizeMb = 64)
 
         int maxDepth = limits.MaxDepth > 0 ? limits.MaxDepth : MaxPly - 1;
         int lastScore = 0;
+        int completedDepth = 0;
 
         for (int depth = 1; depth <= maxDepth; depth++)
         {
-            int score = Negamax(pos, depth, -Inf, Inf, 0);
+            int score = AspirationSearch(pos, depth, lastScore);
 
             if (stop && depth > 1) break;               // discard partial iteration's score
 
             lastScore = score;
+            completedDepth = depth;
             PrintInfo(pos, depth, score);
 
             if (Math.Abs(score) >= Eval.MateBound) break; // forced mate found
@@ -194,7 +246,40 @@ public sealed class Searcher(int ttSizeMb = 64)
         LastQNodes = qNodes;
         LastMs = clock.ElapsedMilliseconds;
         LastScore = lastScore;
+        LastDepth = completedDepth;
         return pvMove;
+    }
+
+    private const int AspMinDepth = 4;
+    private const int AspInitDelta = 16;
+
+    private int AspirationSearch(Position pos, int depth, int prevScore)
+    {
+        rootDepth = depth;
+        if (!optModern || depth < AspMinDepth || Math.Abs(prevScore) >= Eval.MateBound)
+            return Negamax(pos, depth, -Inf, Inf, 0, default);
+
+        int delta = AspInitDelta;
+        int alpha = Math.Max(prevScore - delta, -Inf);
+        int beta  = Math.Min(prevScore + delta, Inf);
+        while (true)
+        {
+            int score = Negamax(pos, depth, alpha, beta, 0, default);
+            if (stop) return score;
+            if (score <= alpha)                                 // fail low: drop alpha, nudge beta toward the score
+            {
+                beta = (alpha + beta) / 2;
+                alpha = Math.Max(score - delta, -Inf);
+            }
+            else if (score >= beta)                             // fail high: raise beta
+            {
+                beta = Math.Min(score + delta, Inf);
+            }
+            else
+                return score;                                   // score strictly inside the window: accept it
+            delta += delta / 2 + 8;                             // widen geometrically each failure
+            if (delta > 2000) { alpha = -Inf; beta = Inf; }     // give up narrowing; search the full width
+        }
     }
 
     /// <summary>
@@ -203,9 +288,9 @@ public sealed class Searcher(int ttSizeMb = 64)
     /// <paramref name="depth"/>. Along the way it consults and updates the transposition table, applies
     /// reverse-futility and null-move pruning, orders moves, and (optionally) reduces late quiet moves (LMR).
     /// At depth 0 it hands off to <see cref="Quiesce"/>. The window is <paramref name="alpha"/>..<paramref
-    /// name="beta"/>; <paramref name="ply"/> is the distance from the root (used for mate scoring).
+    /// name="beta"/>; <paramref name="ply"/> is the distance from the root (used for mate scoring)
     /// </summary>
-    private int Negamax(Position pos, int depth, int alpha, int beta, int ply)
+    private int Negamax(Position pos, int depth, int alpha, int beta, int ply, Move prevMove)
     {
         if (stop) return 0;
         if ((nodes & 4095) == 0 && OutOfTime()) { stop = true; return 0; }
@@ -241,15 +326,26 @@ public sealed class Searcher(int ttSizeMb = 64)
 
         bool inCheck = pos.InCheck(pos.Turn);
 
+        if (optIir && optModern && !root && depth >= 4 && ttMove.ToFrom == 0 && !inCheck)
+            depth--;
+
+        int rfpCap = optModern ? RfpMaxDepthModern : RfpMaxDepth;
+        bool haveStaticEval = !inCheck && depth <= rfpCap && (optRfp || optModern);
+        int staticEval = haveStaticEval ? EvalPos(pos) : 0;
+        if (ply < MaxPly)
+            evalStack[ply] = haveStaticEval ? staticEval : NoStaticEval;
+        bool improving = optImproving && optModern && haveStaticEval && ply >= 2
+            && evalStack[ply - 2] != NoStaticEval && staticEval > evalStack[ply - 2];
+
         // Reverse futility pruning (OPT_RFP / static null move): at shallow non-root, non-check nodes, if
         // the static eval already clears beta by a depth-scaled margin, assume it holds and fail high
         // without searching, skipping the entire quiescence subtree the node would otherwise spawn.
-        if (optRfp && !root && !inCheck && depth <= RfpMaxDepth
+        if (optRfp && !root && !inCheck && depth <= rfpCap
             && beta < Eval.MateBound && beta > -Eval.MateBound)
         {
-            int staticEval = EvalPos(pos);
-            if (staticEval - RfpMargin * depth >= beta)
-                return staticEval - RfpMargin * depth;
+            int margin = (RfpMargin + (improving ? 20 : (optImproving ? -10 : 0))) * depth;
+            if (staticEval - margin >= beta)
+                return staticEval - margin;
         }
 
         // Null-move pruning: give the opponent a free move; if we're still winning, prune. Skipped in
@@ -259,7 +355,7 @@ public sealed class Searcher(int ttSizeMb = 64)
         {
             int r = 2 + depth / 6;
             pos.MakeNullMove(); acc?.PushNull();
-            int nullScore = -Negamax(pos, depth - 1 - r, -beta, -beta + 1, ply + 1);
+            int nullScore = -Negamax(pos, depth - 1 - r, -beta, -beta + 1, ply + 1, default);
             pos.UnmakeNullMove(); acc?.Pop();
             if (stop) return 0;
             if (nullScore >= beta) return beta;
@@ -272,45 +368,79 @@ public sealed class Searcher(int ttSizeMb = 64)
             return inCheck ? -Eval.MateValue + ply : 0;  // checkmate (ply-adjusted) or stalemate
 
         Span<int> scores = stackalloc int[count];
-        ScoreMoves(pos, moves, count, scores, ttMove, ply);
+        ScoreMoves(pos, moves, count, scores, ttMove, ply, prevMove);
 
         int bestScore = -Inf;
         Move bestMove = default;
         int origAlpha = alpha;
         Color us = pos.Turn;
+        bool pvNode = beta - alpha > 1;   // a real PV window (not a null-window scout): reduce/prune less here
+        int prevKey = prevMove.ToFrom != 0 ? ((int)prevMove.From << 6) | (int)prevMove.To : -1;
+        bool trackQuiets = optModern && (optContHist || optBadHist);
+        Span<Move> quietsTried = stackalloc Move[trackQuiets ? 64 : 0];
+        int quietsTriedCount = 0;
 
         for (int i = 0; i < count; i++)
         {
             PickNext(moves, scores, count, i);
             Move m = moves[i];
+            bool quiet = !m.IsCapture && (m.Flags & MoveFlags.Promotions) == 0;
+            int quietHist = quiet ? QuietHistoryScore(us, m, prevKey) : 0;
+
+            if (optModern && !pvNode && !inCheck && quiet && bestScore > -Eval.MateBound
+                && m != killers[ply, 0] && m != killers[ply, 1])
+            {
+                if (depth <= 6 && i >= LmpCount[depth] + (improving ? 2 : (optImproving ? -1 : 0))) break;
+                if (depth <= 2 && staticEval + FutMargin[depth] + (improving ? 40 : (optImproving ? -30 : 0)) <= alpha) break;
+                if (!optContHist && optBadHist && depth <= BadHistPruneDepth && i >= 6
+                    && badHistory[(int)us][MoveKey(m)] < BadHistPruneThreshold + depth * 64)
+                    continue;
+            }
+
+            if (optModern && optMainSee && !root && !pvNode && !inCheck && !quiet && bestScore > -Eval.MateBound
+                && depth <= MainSeePruneDepth && m != ttMove
+                && m.IsCapture && (m.Flags & MoveFlags.Promotions) == 0
+                && PieceTypeValue(pos.At(m.From)) > PieceTypeValue(pos.At(m.To))
+                && See(pos, m) < -MainSeeMargin * depth)
+                continue;
+
+            if (trackQuiets && quiet && quietsTriedCount < quietsTried.Length)
+                quietsTried[quietsTriedCount++] = m;
 
             PlayMove(pos, us, m);
+            bool givesCheck = pos.InCheck(pos.Turn);
+
+            int ext = optModern && givesCheck && ply < rootDepth + ExtBudget ? 1 : 0;
+            int newDepth = depth - 1 + ext;
+
             int score;
             if (i == 0)
             {
-                score = -Negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                score = -Negamax(pos, newDepth, -beta, -alpha, ply + 1, m);
             }
             else
             {
                 // PVS + LMR. Reduce late, quiet, non-PV, non-checking moves; the reduced search uses a
                 // null window. If it beats alpha we re-search at full depth (still null window) before the
                 // standard PVS full-window widen, so a genuinely good reduced move is always verified.
-                int reducedDepth = depth - 1;
-                if (optLmr && depth >= 3 && i >= 3 && !inCheck
-                    && !m.IsCapture && (m.Flags & MoveFlags.Promotions) == 0
-                    && m != ttMove && m != killers[ply, 0] && m != killers[ply, 1]
-                    && !pos.InCheck(pos.Turn))   // PlayMove already flipped Turn => tests "m gives check"
+                int searchDepth = newDepth;
+                if (UseLmr && depth >= 3 && i >= (pvNode ? 2 : 1) && !inCheck && ext == 0
+                    && quiet && m != ttMove && m != killers[ply, 0] && m != killers[ply, 1])
                 {
                     int rr = LmrTable[Math.Min(depth, MaxPly - 1), Math.Min(i, 63)];
+                    if (pvNode) rr--;   // PV moves are more likely to matter: reduce one ply less
+                    if (improving) rr--;
+                    else if (optImproving && optModern && haveStaticEval) rr++;
+                    if (quietHist > HistReduceBar) rr--;  // historically good
                     if (rr < 1) rr = 1;
-                    reducedDepth = Math.Max(1, depth - 1 - rr);
+                    searchDepth = Math.Max(1, newDepth - rr);
                 }
 
-                score = -Negamax(pos, reducedDepth, -alpha - 1, -alpha, ply + 1);
-                if (score > alpha && reducedDepth < depth - 1)
-                    score = -Negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1);
+                score = -Negamax(pos, searchDepth, -alpha - 1, -alpha, ply + 1, m);
+                if (score > alpha && searchDepth < newDepth)
+                    score = -Negamax(pos, newDepth, -alpha - 1, -alpha, ply + 1, m);
                 if (score > alpha && score < beta)
-                    score = -Negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                    score = -Negamax(pos, newDepth, -beta, -alpha, ply + 1, m);
             }
             UndoMove(pos, us, m);
 
@@ -326,11 +456,19 @@ public sealed class Searcher(int ttSizeMb = 64)
 
             if (alpha >= beta)
             {
-                // Beta cutoff. Reward quiet cutoff moves so they're tried earlier next time.
-                if (!m.IsCapture && (m.Flags & MoveFlags.Promotions) == 0)
+                // Beta cutoff. Reward quiet cutoff moves so they're tried earlier next time
+                if (quiet)
                 {
                     if (killers[ply, 0] != m) { killers[ply, 1] = killers[ply, 0]; killers[ply, 0] = m; }
-                    history[(int)us][((int)m.From << 6) | (int)m.To] += depth * depth;
+                    if (optContHist && optModern)
+                        UpdateQuietHistories(us, m, prevKey, depth, quietsTried[..quietsTriedCount]);
+                    else
+                    {
+                        history[(int)us][MoveKey(m)] += depth * depth;
+                        if (optModern && optBadHist)
+                            UpdateBadHistory(us, m, depth, quietsTried[..quietsTriedCount]);
+                    }
+                    if (prevKey >= 0) counterMoves[prevKey] = m;
                 }
                 break;
             }
@@ -398,13 +536,13 @@ public sealed class Searcher(int ttSizeMb = 64)
         }
 
         Span<Move> moves = stackalloc Move[256];
-        int count = GenerateLegal(pos, moves);
+        int count = inCheck ? GenerateLegal(pos, moves) : GenerateNoisyLegal(pos, moves);
 
         if (count == 0)
-            return inCheck ? -Eval.MateValue + ply : 0;
+            return inCheck ? -Eval.MateValue + ply : alpha;
 
         Span<int> scores = stackalloc int[count];
-        ScoreMoves(pos, moves, count, scores, qttMove, ply);
+        ScoreMoves(pos, moves, count, scores, qttMove, ply, default);
 
         Color us = pos.Turn;
         for (int i = 0; i < count; i++)
@@ -434,7 +572,9 @@ public sealed class Searcher(int ttSizeMb = 64)
 
             // OPT_SEE: skip captures that lose material on the static exchange, since they cannot raise alpha
             // in a quiet node and only spawn wasted child q-nodes (and NNUE evals).
-            if (optSee && !inCheck && m.IsCapture && See(pos, m) < 0)
+            if (optSee && !inCheck && m.IsCapture
+                && PieceTypeValue(pos.At(m.From)) > PieceTypeValue(pos.At(m.To))
+                && See(pos, m) < 0)
                 continue;
 
             PlayMove(pos, us, m);
@@ -549,9 +689,11 @@ public sealed class Searcher(int ttSizeMb = 64)
     /// prune far more). The priority is: the transposition-table move, then captures/promotions ranked by
     /// MVV-LVA (most-valuable victim, least-valuable attacker), then killer moves, then the history heuristic.
     /// </summary>
-    private void ScoreMoves(Position pos, Span<Move> moves, int count, Span<int> scores, Move ttMove, int ply)
+    private void ScoreMoves(Position pos, Span<Move> moves, int count, Span<int> scores, Move ttMove, int ply, Move prevMove)
     {
         Color us = pos.Turn;
+        int prevKey = optModern && prevMove.ToFrom != 0 ? ((int)prevMove.From << 6) | (int)prevMove.To : -1;
+        Move counter = prevKey >= 0 ? counterMoves[prevKey] : default;
         for (int i = 0; i < count; i++)
         {
             Move m = moves[i];
@@ -564,15 +706,22 @@ public sealed class Searcher(int ttSizeMb = 64)
                 int victim = m.IsCapture ? PieceTypeValue(pos.At(m.To)) : 0;
                 int attacker = PieceTypeValue(pos.At(m.From));
                 int promo = (m.Flags & MoveFlags.Promotions) != 0 ? Eval.PieceValue[(int)PieceType.Queen] : 0;
-                scores[i] = 1_000_000 + victim * 16 - attacker + promo;
+                int mvv = victim * 16 - attacker + promo;
+                bool losing = optModern && m.IsCapture && (m.Flags & MoveFlags.Promotions) == 0
+                    && attacker > victim && See(pos, m) < 0;
+                scores[i] = losing ? -1_000_000 + mvv : 1_000_000 + mvv;
             }
             else if (m == killers[ply, 0] || m == killers[ply, 1])
             {
                 scores[i] = 900_000;
             }
+            else if (counter.ToFrom != 0 && m == counter)
+            {
+                scores[i] = 850_000;
+            }
             else
             {
-                scores[i] = history[(int)us][((int)m.From << 6) | (int)m.To];
+                scores[i] = QuietHistoryScore(us, m, prevKey);
             }
         }
     }
@@ -598,6 +747,77 @@ public sealed class Searcher(int ttSizeMb = 64)
         return Eval.PieceValue[(int)Types.TypeOf(p)];
     }
 
+    private static int MoveKey(Move m) => ((int)m.From << 6) | (int)m.To;
+
+    private int QuietHistoryScore(Color us, Move m, int prevKey)
+    {
+        int key = MoveKey(m);
+        int score = history[(int)us][key];
+        if (optContHist && optModern && prevKey >= 0 && continuationHistory[prevKey] is { } row)
+            score += row[key];
+        return score;
+    }
+
+    private void UpdateQuietHistories(Color us, Move cutoff, int prevKey, int depth, Span<Move> quietsTried)
+    {
+        int bonus = Math.Min(HistoryMax, depth * depth);
+        int malus = -bonus;
+        int cutoffKey = MoveKey(cutoff);
+
+        UpdateHistory(history[(int)us], cutoffKey, bonus);
+        if (optModern && prevKey >= 0)
+            UpdateContinuationHistory(prevKey, cutoffKey, bonus);
+
+        for (int i = 0; i < quietsTried.Length; i++)
+        {
+            Move m = quietsTried[i];
+            if (m == cutoff) continue;
+
+            int key = MoveKey(m);
+            UpdateHistory(history[(int)us], key, malus);
+            if (optModern && prevKey >= 0)
+                UpdateContinuationHistory(prevKey, key, malus);
+        }
+    }
+
+    private static void UpdateHistory(int[] table, int key, int bonus)
+    {
+        bonus = Math.Clamp(bonus, -HistoryMax, HistoryMax);
+        table[key] += bonus - table[key] * Math.Abs(bonus) / HistoryMax;
+    }
+
+    private void UpdateBadHistory(Color us, Move cutoff, int depth, Span<Move> quietsTried)
+    {
+        short[] table = badHistory[(int)us];
+        int bonus = Math.Min(BadHistoryMax, 8 * depth * depth);
+        int malus = -bonus / 2;
+
+        UpdateShortHistory(table, MoveKey(cutoff), bonus);
+        for (int i = 0; i < quietsTried.Length; i++)
+        {
+            Move m = quietsTried[i];
+            if (m == cutoff) continue;
+            UpdateShortHistory(table, MoveKey(m), malus);
+        }
+    }
+
+    private static void UpdateShortHistory(short[] table, int key, int bonus)
+    {
+        bonus = Math.Clamp(bonus, -BadHistoryMax, BadHistoryMax);
+        int value = table[key];
+        value += bonus - value * Math.Abs(bonus) / BadHistoryMax;
+        table[key] = (short)Math.Clamp(value, -BadHistoryMax, BadHistoryMax);
+    }
+
+    private void UpdateContinuationHistory(int prevKey, int key, int bonus)
+    {
+        short[] row = continuationHistory[prevKey] ??= new short[MoveKeyCount];
+        int value = row[key];
+        bonus = Math.Clamp(bonus, -HistoryMax, HistoryMax);
+        value += bonus - value * Math.Abs(bonus) / HistoryMax;
+        row[key] = (short)Math.Clamp(value, -HistoryMax, HistoryMax);
+    }
+
     /// <summary>
     /// True if the colour has any piece other than pawns and the king. Null-move pruning needs this because in a king-and-pawn endgame "passing" can be the only good option (zugzwang), making the null-move assumption unsafe.
     /// </summary>
@@ -609,6 +829,7 @@ public sealed class Searcher(int ttSizeMb = 64)
 
     private bool OutOfTime()
     {
+        if (maxNodes > 0 && nodes >= maxNodes) return true;
         if (infinite) return false;
         return clock.ElapsedMilliseconds >= deadline;
     }
@@ -622,6 +843,11 @@ public sealed class Searcher(int ttSizeMb = 64)
         pos.Turn == Color.White
             ? pos.GenerateLegalsInto<White>(buffer)
             : pos.GenerateLegalsInto<Black>(buffer);
+
+    public static int GenerateNoisyLegal(Position pos, Span<Move> buffer) =>
+        pos.Turn == Color.White
+            ? pos.GenerateNoisyLegalsInto<White>(buffer)
+            : pos.GenerateNoisyLegalsInto<Black>(buffer);
 
     private void PrintInfo(Position pos, int depth, int score)
     {

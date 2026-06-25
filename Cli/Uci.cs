@@ -24,6 +24,7 @@ public static class Uci
         Position.Set(Types.DEFAULT_FEN, pos);
         var searcher = new Searcher();
         if (!string.IsNullOrEmpty(initialNet)) LoadNet(searcher, initialNet);
+        else AutoLoadNet(searcher);
 
         string? line;
         while ((line = Console.ReadLine()) != null)
@@ -39,6 +40,8 @@ public static class Uci
                     Console.WriteLine("id name ChessEngine");
                     Console.WriteLine("id author Chess");
                     Console.WriteLine("option name EvalFile type string default <none>");
+                    Console.WriteLine("option name Hash type spin default 64 min 1 max 4096");
+                    Console.WriteLine("option name Threads type spin default 1 min 1 max 1");
                     Console.WriteLine("uciok");
                     break;
                 case "isready": Console.WriteLine("readyok"); break;
@@ -59,6 +62,18 @@ public static class Uci
         catch (Exception e) { Console.WriteLine($"info string failed to load net: {e.Message}"); }
     }
 
+    private static void AutoLoadNet(Searcher s)
+    {
+        foreach (var name in new[] { "train/best.nnue", "train/latest.nnue" })
+        {
+            string full = Paths.InModels(name);
+            if (!System.IO.File.Exists(full)) continue;
+            try { s.SetNnue(NnueNetwork.Load(full)); Console.WriteLine($"info string auto-loaded net {full}"); return; }
+            catch (Exception e) { Console.WriteLine($"info string failed to auto-load net {full}: {e.Message}"); }
+        }
+        Console.WriteLine("info string no net found under workspace/models/train, using hand-crafted eval");
+    }
+
     /// <summary>
     /// Handle "setoption". Only EvalFile is supported: it points at an NNUE net to load.
     /// </summary>
@@ -68,9 +83,15 @@ public static class Uci
         // Locate the "name" and "value" keywords by position rather than assuming a fixed layout, since
         // the option name itself can be multiple tokens.
         int ni = Array.IndexOf(t, "name"), vi = Array.IndexOf(t, "value");
-        if (ni >= 0 && vi > ni && vi + 1 < t.Length &&
-            string.Join(' ', t[(ni + 1)..vi]).Equals("EvalFile", StringComparison.OrdinalIgnoreCase))
-            LoadNet(s, t[vi + 1]);
+        if (ni < 0 || vi <= ni || vi + 1 >= t.Length) return;
+        string name = string.Join(' ', t[(ni + 1)..vi]);
+        string value = t[vi + 1];
+
+        if (name.Equals("EvalFile", StringComparison.OrdinalIgnoreCase))
+            LoadNet(s, value);
+        else if (name.Equals("Hash", StringComparison.OrdinalIgnoreCase) && int.TryParse(value, out int mb))
+            s.SetHashSize(Math.Clamp(mb, 1, 4096));
+        // "Threads" is accepted and ignored (single-threaded search); see the uci handshake.
     }
 
     /// <summary>
@@ -154,6 +175,7 @@ public static class Uci
         }
         else limits.MaxDepth = 8;
 
+        // !!Bug
         Move best = searcher.Think(pos, limits);
         Console.WriteLine($"bestmove {(best.ToFrom == 0 ? "0000" : best.ToString())}");
     }

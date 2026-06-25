@@ -19,10 +19,6 @@ public sealed class QAccumulatorStack
     private readonly int[] hce;         // [ply] incremental hand-crafted eval (white POV), parallel to accumulators
     public int Top { get; private set; }
 
-    // OPT_INCEVAL: only maintain the incremental hand-crafted eval stack when the flag is on, so the
-    // baseline pays nothing. Bit-identical to Eval.Evaluate (integer add/sub of the same material+PST terms).
-    private static readonly bool MaintainHce = Environment.GetEnvironmentVariable("OPT_INCEVAL") == "1";
-
     /// <summary>
     /// Preallocates the per-ply int16 accumulator buffers (and the optional hand-crafted-eval stack) for both perspectives.
     /// </summary>
@@ -43,7 +39,7 @@ public sealed class QAccumulatorStack
     {
         Array.Copy(white[Top], white[Top + 1], H);
         Array.Copy(black[Top], black[Top + 1], H);
-        if (MaintainHce) hce[Top + 1] = hce[Top];   // a null move changes no material/PST
+        hce[Top + 1] = hce[Top];
         Top++;
     }
 
@@ -55,7 +51,7 @@ public sealed class QAccumulatorStack
         Top = 0;
         RefreshOne(white[0], pos, Color.White);
         RefreshOne(black[0], pos, Color.Black);
-        if (MaintainHce) hce[0] = ComputeHceWhite(pos);
+        hce[0] = ComputeHceWhite(pos);
     }
 
     /// <summary>
@@ -64,25 +60,10 @@ public sealed class QAccumulatorStack
     public int Evaluate(Color stm) =>
         stm == Color.White ? net.Forward(white[Top], black[Top]) : net.Forward(black[Top], white[Top]);
 
-    /// <summary>Incrementally-maintained hand-crafted eval at the current top, side-to-move POV. Equal to
-    /// Eval.Evaluate(pos) bit-for-bit (integer material+PST). Only valid when OPT_INCEVAL is set.</summary>
+    /// <summary>
+    /// Incrementally-maintained hand-crafted eval at the current top, side-to-move POV.
+    /// </summary>
     public int EvaluateHce(Color stm) => stm == Color.White ? hce[Top] : -hce[Top];
-
-    // White-POV material+PST, identical decomposition to Eval.ScoreSide summed white-minus-black.
-    private static int ComputeHceWhite(Position pos)
-    {
-        int s = 0;
-        for (int sq = 0; sq < 64; sq++)
-        {
-            Piece p = pos.At((Square)sq);
-            if (p == Piece.NoPiece) continue;
-            PieceType pt = Types.TypeOf(p);
-            bool wht = Types.ColorOf(p) == Color.White;
-            int term = Eval.PieceValue[(int)pt] + Eval.Pst[(int)pt][wht ? sq : sq ^ 56];
-            s += wht ? term : -term;
-        }
-        return s;
-    }
 
     /// <summary>
     /// Scalar-path correction at the current top, kept as a reference for validating the SIMD forward.
@@ -107,22 +88,7 @@ public sealed class QAccumulatorStack
         Span<AccumulatorStack.Change> changes = stackalloc AccumulatorStack.Change[5];
         int n = AccumulatorStack.ComputeChanges(m, movingPiece, capturedPiece, changes);
 
-        // OPT_INCEVAL: fold the same (piece, square, sign) changes into the white-POV hand-crafted eval.
-        // Unlike the NNUE features this INCLUDES kings (the hand-crafted eval has a KingPst).
-        if (MaintainHce)
-        {
-            int delta = 0;
-            for (int c = 0; c < n; c++)
-            {
-                Piece pc = changes[c].Piece;
-                PieceType pt = Types.TypeOf(pc);
-                bool wht = Types.ColorOf(pc) == Color.White;
-                int term = Eval.PieceValue[(int)pt] + Eval.Pst[(int)pt][wht ? changes[c].Sq : changes[c].Sq ^ 56];
-                int signed = wht ? term : -term;                 // white POV
-                delta += changes[c].Sign > 0 ? signed : -signed;  // Sign>0 = piece added, else removed
-            }
-            hce[child] = hce[parent] + delta;
-        }
+        hce[child] = hce[parent] + HceDelta(changes, n);
 
         UpdateSide(Color.White, parent, child, posAfter, kingMoved && moved == Color.White, changes, n);
         UpdateSide(Color.Black, parent, child, posAfter, kingMoved && moved == Color.Black, changes, n);
@@ -160,5 +126,38 @@ public sealed class QAccumulatorStack
             if (p == Piece.NoPiece || Types.TypeOf(p) == PieceType.King) continue;
             net.AddFeature(acc, FeatureSet.Index(persp, kingSq, p, (Square)sq));
         }
+    }
+
+    private static int ComputeHceWhite(Position pos)
+    {
+        int score = 0;
+        for (int sq = 0; sq < 64; sq++)
+        {
+            Piece p = pos.At((Square)sq);
+            if (p == Piece.NoPiece) continue;
+            int term = HceTerm(p, sq);
+            score += Types.ColorOf(p) == Color.White ? term : -term;
+        }
+        return score;
+    }
+
+    private static int HceDelta(Span<AccumulatorStack.Change> changes, int count)
+    {
+        int delta = 0;
+        for (int i = 0; i < count; i++)
+        {
+            Piece p = changes[i].Piece;
+            int term = HceTerm(p, changes[i].Sq);
+            int signed = Types.ColorOf(p) == Color.White ? term : -term;
+            delta += changes[i].Sign > 0 ? signed : -signed;
+        }
+        return delta;
+    }
+
+    private static int HceTerm(Piece p, int sq)
+    {
+        PieceType pt = Types.TypeOf(p);
+        int pstSq = Types.ColorOf(p) == Color.White ? sq : sq ^ 56;
+        return Eval.PieceValue[(int)pt] + Eval.Pst[(int)pt][pstSq];
     }
 }

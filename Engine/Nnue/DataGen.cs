@@ -129,6 +129,8 @@ public static class DataGen
         public Worker(NnueNetwork? net)
         {
             searcher = new Searcher(ttSizeMb: 16) { Quiet = true };  // small TT, since self-play searches are shallow
+            searcher.SetOpts(delta: true, see: false, rfp: true, qtt: true, lmr: false);
+            searcher.SetModern(false);
             if (net != null) searcher.SetNnue(net);
         }
 

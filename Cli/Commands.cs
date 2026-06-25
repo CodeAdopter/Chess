@@ -107,30 +107,24 @@ public static class Commands
     /// its search is as strong as A, so the optimisations it adds don't degrade move quality (a proxy for
     /// data quality). Specs: comma list of {delta,see,rfp,qtt,lmr}, or "base"/"sound"/"all".</summary>
     public static void OptMatch(string net, int games, int depth, string aSpec, string bSpec) =>
+        OptMatchCore(net, games, SearchLimits.Depth(depth), $"depth={depth}", aSpec, bSpec);
+
+    public static void OptMatchTime(string net, int games, long movetimeMs, string aSpec, string bSpec) =>
+        OptMatchCore(net, games, SearchLimits.Time(movetimeMs), $"movetime={movetimeMs}ms", aSpec, bSpec);
+
+    public static void OptMatchNodes(string net, int games, long maxNodes, string aSpec, string bSpec) =>
+        OptMatchCore(net, games, SearchLimits.Nodes(maxNodes), $"nodes={maxNodes}", aSpec, bSpec);
+
+    private static void OptMatchCore(string net, int games, SearchLimits limits, string limitLabel, string aSpec, string bSpec) =>
         Run("optmatch", ct =>
         {
             var n = NnueNetwork.Load(Paths.InModels(net));
-            var (ad, asee, ar, aq, al) = ParseOpts(aSpec);
-            var (bd, bsee, br, bq, bl) = ParseOpts(bSpec);
-
-            var sa = new Searcher(16) { Quiet = true }; sa.SetNnue(n); sa.SetOpts(ad, asee, ar, aq, al);
-            var sb = new Searcher(16) { Quiet = true }; sb.SetNnue(n); sb.SetOpts(bd, bsee, br, bq, bl);
-
-            var rng = new Random(12345);
-            int w = 0, d = 0, l = 0;
-            for (int g = 0; g < games && !ct.IsCancellationRequested; g++)
-            {
-                bool aWhite = (g & 1) == 0;   // alternate colours so neither side gets a colour bias
-                var r = GameRunner.PlayGame(aWhite ? sa : sb, aWhite ? sb : sa, depth, rng, 10);
-                if (r == GameRunner.Result.Draw) d++;
-                else if ((r == GameRunner.Result.WhiteWins) == aWhite) w++;
-                else l++;
-                if ((g + 1) % 20 == 0) Console.WriteLine($"  {g + 1}/{games}: A +{w} ={d} -{l}");
-            }
+            var (w, d, l) = PlayAb(n, aSpec, bSpec, games, limits, ct,
+                (g, ww, dd, ll) => Console.WriteLine($"  {g}/{games}: A +{ww} ={dd} -{ll}"));
             int played = w + d + l;
             double score = played > 0 ? (w + 0.5 * d) / played : 0;
             double sigma = played > 0 ? 50.0 / Math.Sqrt(played) : 0;   // ~1σ on the score in percentage points
-            Console.WriteLine($"\nA=[{aSpec}]  vs  B=[{bSpec}]   net={net}  depth={depth}  games={played}");
+            Console.WriteLine($"\nA=[{aSpec}]  vs  B=[{bSpec}]   net={net}  {limitLabel}  games={played}");
             Console.WriteLine($"B score (vs A): {1 - score:P1}   A: +{w} ={d} -{l}   1σ ≈ ±{sigma:F1}%");
             // Verdict: "not measurably weaker within 2σ" is the bar we want an optimisation to clear
             // before it earns its place. Anything past 2σ down is treated as a real regression.
@@ -139,18 +133,88 @@ public static class Commands
                 : "  => B looks weaker than A (beyond 2σ); the optimisations may be degrading the search/labels.");
         });
 
-    /// <summary>Parse an optimisation spec into the five searcher flags. Accepts the named presets
-    /// "base"/"none"/"off"/"-" (everything off), "sound" (delta+rfp+qtt), "all" (everything on), or a
-    /// comma-separated list drawn from {delta,see,rfp,qtt,lmr}.</summary>
-    private static (bool d, bool s, bool r, bool q, bool l) ParseOpts(string spec)
+    /// <summary>
+    /// Play an A vs B match over one shared net, callback fires every 20 games with (played, w, d, l).
+    /// </summary>
+    private static (int w, int d, int l) PlayAb(NnueNetwork n, string aSpec, string bSpec, int games,
+        SearchLimits limits, CancellationToken ct, Action<int, int, int, int>? progress = null)
+    {
+        var (ad, asee, ar, aq, al, am, aimp, ach, aiir) = ParseOpts(aSpec);
+        var (bd, bsee, br, bq, bl, bm, bimp, bch, biir) = ParseOpts(bSpec);
+
+        var sa = new Searcher(16) { Quiet = true }; sa.SetNnue(n); sa.SetOpts(ad, asee, ar, aq, al); sa.SetModern(am); sa.SetHistory(aimp, ach); sa.SetIir(aiir);
+        var sb = new Searcher(16) { Quiet = true }; sb.SetNnue(n); sb.SetOpts(bd, bsee, br, bq, bl); sb.SetModern(bm); sb.SetHistory(bimp, bch); sb.SetIir(biir);
+
+        var rng = new Random(12345);
+        int w = 0, d = 0, l = 0;
+        for (int g = 0; g < games && !ct.IsCancellationRequested; g++)
+        {
+            bool aWhite = (g & 1) == 0;   // alt colors to prevent bias
+            var r = GameRunner.PlayGame(aWhite ? sa : sb, aWhite ? sb : sa, limits, rng, 10);
+            if (r == GameRunner.Result.Draw) d++;
+            else if (r == GameRunner.Result.WhiteWins == aWhite) w++;
+            else l++;
+            if ((g + 1) % 20 == 0) progress?.Invoke(g + 1, w, d, l);
+        }
+        return (w, d, l);
+    }
+
+    /// <summary>
+    /// Tests each candidate option against the baseline at a fixed node budget, 
+    /// </summary>
+    public static void OptScreen(string net, int games, long nodes, string baseline, string candidatesCsv) =>
+        Run("optscreen", ct =>
+        {
+            var n = NnueNetwork.Load(Paths.InModels(net));
+            var limits = SearchLimits.Nodes(nodes);
+            var cand = candidatesCsv.Split(',', StringSplitOptions.RemoveEmptyEntries);
+
+            var labels = new string[cand.Length + 1];
+            var bSpecs = new string[cand.Length + 1];
+            labels[0] = $"{baseline}(self)"; bSpecs[0] = baseline;
+            for (int i = 0; i < cand.Length; i++) { labels[i + 1] = cand[i]; bSpecs[i + 1] = $"{baseline},{cand[i]}"; }
+
+            double sigma = games > 0 ? 50.0 / Math.Sqrt(games) : 0;
+            Console.WriteLine($"screen  net={net}  baseline=[{baseline}]  games={games}  nodes={nodes}  1σ≈±{sigma:F1}%  (bar: B within 2σ of 50%)");
+            Console.WriteLine($"running {bSpecs.Length} comparisons in parallel (each shares the read-only net, distinct searchers)...");
+
+            var results = new (int w, int d, int l)[bSpecs.Length];
+            int done = 0;
+            var gate = new object();
+            Parallel.For(0, bSpecs.Length,
+                new ParallelOptions { MaxDegreeOfParallelism = bSpecs.Length, CancellationToken = ct },
+                i =>
+                {
+                    results[i] = PlayAb(n, baseline, bSpecs[i], games, limits, ct);
+                    lock (gate) { done++; Console.WriteLine($"  [{done}/{bSpecs.Length}] {labels[i]} done"); }
+                });
+
+            Console.WriteLine($"\n{"candidate",-22}{"B%",7}  {"A W-D-L",-16}verdict");
+            for (int i = 0; i < bSpecs.Length; i++)
+            {
+                var (w, d, l) = results[i];
+                int played = w + d + l;
+                double bScore = played > 0 ? 1 - (w + 0.5 * d) / played : 0;
+                bool ok = bScore >= 0.5 - 2 * sigma / 100;
+                string wdl = $"+{w} ={d} -{l}";
+                Console.WriteLine($"{labels[i],-22}{bScore * 100,6:F1}%  {wdl,-16}{(ok ? "ok" : "WEAKER (>2sd)")}");
+            }
+            Console.WriteLine("\nself row gauges noise; promote only candidates clearly >= 50%, re-test survivors at more games.");
+        });
+
+    /// Parses an optimisation spec into search flags, supporting presets and feature toggles for benchmarking search improvements.
+    private static (bool d, bool s, bool r, bool q, bool l, bool m, bool imp, bool ch, bool iir) ParseOpts(string spec)
     {
         spec = spec.ToLowerInvariant().Trim();
-        if (spec is "base" or "none" or "off" or "-") return (false, false, false, false, false);
-        if (spec == "sound") return (true, false, true, true, false);
+        if (spec is "base" or "none" or "off" or "-") return (false, false, false, false, false, false, true, true, true);
+        if (spec == "sound") return (true, false, true, true, false, false, true, true, true);
         bool All = spec == "all";
         var parts = spec.Split(',', StringSplitOptions.RemoveEmptyEntries);
         bool Has(string k) => All || Array.IndexOf(parts, k) >= 0;
-        return (Has("delta"), Has("see"), Has("rfp"), Has("qtt"), Has("lmr"));
+        bool improving = Array.IndexOf(parts, "no-improving") < 0;
+        bool conthist  = Array.IndexOf(parts, "no-conthist") < 0;
+        bool iir       = Array.IndexOf(parts, "no-iir") < 0;
+        return (Has("delta"), Has("see"), Has("rfp"), Has("qtt"), Has("lmr"), Has("modern"), improving, conthist, iir);
     }
 
     /// <summary>

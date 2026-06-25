@@ -28,7 +28,8 @@ Zobrist.Init();
 // No args → interactive control center. With args → run one command and exit (for scripting).
 if (args.Length == 0)
 {
-    Menu.Run();
+    if (Console.IsInputRedirected) Uci.Run();
+    else Menu.Run();
     return;
 }
 
@@ -61,6 +62,15 @@ switch (args[0].ToLowerInvariant())
         break;
     case "optmatch":
         Commands.OptMatch(S(1, "train/best.nnue"), I(2, 200), I(3, 4), S(4, "base"), S(5, "sound"));
+        break;
+    case "optmatch-time":
+        Commands.OptMatchTime(S(1, "train/best.nnue"), I(2, 100), I(3, 1000), S(4, "base"), S(5, "sound"));
+        break;
+    case "optmatch-nodes":
+        Commands.OptMatchNodes(S(1, "train/best.nnue"), I(2, 100), I(3, 200_000), S(4, "base"), S(5, "sound"));
+        break;
+    case "optscreen":
+        Commands.OptScreen(S(1, "train/best.nnue"), I(2, 200), I(3, 30_000), S(4, "modern"), S(5, "no-improving,no-conthist,no-iir"));
         break;
     case "show":
         Commands.Show(S(1, "net.nnue"), I(2, 6));

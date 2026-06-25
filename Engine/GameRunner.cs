@@ -73,6 +73,9 @@ public static class GameRunner
     /// opening plies for variety. Returns the result from White's POV.
     /// </summary>
     public static Result PlayGame(Searcher white, Searcher black, int depth, Random rng, int randomPlies, int maxPlies = 400)
+        => PlayGame(white, black, SearchLimits.Depth(depth), rng, randomPlies, maxPlies);
+
+    public static Result PlayGame(Searcher white, Searcher black, SearchLimits limits, Random rng, int randomPlies, int maxPlies = 400)
     {
         var pos = new Position();
         Position.Set(Types.DEFAULT_FEN, pos);
@@ -99,7 +102,7 @@ public static class GameRunner
             else
             {
                 var s = pos.Turn == Color.White ? white : black;
-                m = s.Think(pos, SearchLimits.Depth(depth));
+                m = s.Think(pos, limits);
                 if (m.ToFrom == 0) return Result.Draw;
             }
             pos.Play(pos.Turn, m);

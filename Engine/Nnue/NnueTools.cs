@@ -85,7 +85,7 @@ public static class NnueTools
         Span<Move> buf = stackalloc Move[256];
         var qacc = new QAccumulatorStack(qnet);      // incremental
         var qfresh = new QAccumulatorStack(qnet);     // full-refresh reference (reused; RefreshRoot resets it)
-        long n = 0, sumAbs = 0; int maxDiff = 0; long incMismatch = 0, simdMismatch = 0;
+        long n = 0, sumAbs = 0; int maxDiff = 0; long incMismatch = 0, simdMismatch = 0, hceMismatch = 0;
 
         for (int g = 0; g < 60; g++)
         {
@@ -100,6 +100,7 @@ public static class NnueTools
 
                 int qInc = qacc.Evaluate(pos.Turn);            // incremental quant (SIMD)
                 if (qInc != qacc.EvaluateScalar(pos.Turn)) simdMismatch++;   // SIMD path must equal scalar exactly
+                if (qacc.EvaluateHce(pos.Turn) != Eval.Evaluate(pos)) hceMismatch++;
                 qfresh.RefreshRoot(pos);
                 if (qInc != qfresh.Evaluate(pos.Turn)) incMismatch++;   // exactness of incremental updates
 
@@ -119,7 +120,8 @@ public static class NnueTools
         Console.WriteLine($"  max  |quant - float| = {maxDiff} cp");
         Console.WriteLine($"  incremental vs full-refresh mismatches = {incMismatch}  (must be 0, int16 is exact)");
         Console.WriteLine($"  SIMD vs scalar forward mismatches      = {simdMismatch}  (must be 0, same integer math)");
-        Console.WriteLine(incMismatch == 0 && simdMismatch == 0 && maxDiff < 50 ? "QUANT OK" : "QUANT NEEDS REVIEW");
+        Console.WriteLine($"  incremental hand-crafted mismatches   = {hceMismatch}  (must be 0, residual baseline)");
+        Console.WriteLine(incMismatch == 0 && simdMismatch == 0 && hceMismatch == 0 && maxDiff < 50 ? "QUANT OK" : "QUANT NEEDS REVIEW");
     }
 
     /// <summary>
