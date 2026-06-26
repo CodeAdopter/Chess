@@ -102,6 +102,23 @@ public sealed class QuantizedNetwork
         for (; i < H; i++) acc[i] -= L0[b + i];
     }
 
+    // fused updates
+    public void AddSub(short[] acc, int fAdd, int fSub)
+    {
+        int ba = fAdd * H, bs = fSub * H, w = Vector<short>.Count, i = 0;
+        for (; i <= H - w; i += w)
+            (new Vector<short>(acc, i) + new Vector<short>(L0, ba + i) - new Vector<short>(L0, bs + i)).CopyTo(acc, i);
+        for (; i < H; i++) acc[i] += (short)(L0[ba + i] - L0[bs + i]);
+    }
+
+    public void AddSubSub(short[] acc, int fAdd, int fSub1, int fSub2)
+    {
+        int ba = fAdd * H, b1 = fSub1 * H, b2 = fSub2 * H, w = Vector<short>.Count, i = 0;
+        for (; i <= H - w; i += w)
+            (new Vector<short>(acc, i) + new Vector<short>(L0, ba + i) - new Vector<short>(L0, b1 + i) - new Vector<short>(L0, b2 + i)).CopyTo(acc, i);
+        for (; i < H; i++) acc[i] += (short)(L0[ba + i] - L0[b1 + i] - L0[b2 + i]);
+    }
+
     /// <summary>
     /// Seed an accumulator with the feature-transformer bias (start of a full refresh).
     /// </summary>

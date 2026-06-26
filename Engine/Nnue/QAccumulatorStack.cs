@@ -107,12 +107,24 @@ public sealed class QAccumulatorStack
         short[] src = persp == Color.White ? white[parent] : black[parent];
         Array.Copy(src, dst, H);
 
+        // fused updates https://www.chessprogramming.org/NNUE
         Square kingSq = Bitboard.Bsf(posAfter.BitboardOf(persp, PieceType.King));
+        Span<int> adds = stackalloc int[2];
+        Span<int> subs = stackalloc int[3];
+        int na = 0, ns = 0;
         for (int c = 0; c < n; c++)
         {
             if (FeatureSet.PieceKind(persp, changes[c].Piece) < 0) continue;   // kings are not features
             int f = FeatureSet.Index(persp, kingSq, changes[c].Piece, (Square)changes[c].Sq);
-            if (changes[c].Sign > 0) net.AddFeature(dst, f); else net.SubFeature(dst, f);
+            if (changes[c].Sign > 0) adds[na++] = f; else subs[ns++] = f;
+        }
+
+        if (na == 1 && ns == 1) net.AddSub(dst, adds[0], subs[0]);
+        else if (na == 1 && ns == 2) net.AddSubSub(dst, adds[0], subs[0], subs[1]);
+        else
+        {
+            for (int a = 0; a < na; a++) net.AddFeature(dst, adds[a]);
+            for (int s = 0; s < ns; s++) net.SubFeature(dst, subs[s]);
         }
     }
 
