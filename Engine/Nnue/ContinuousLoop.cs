@@ -28,9 +28,15 @@ public sealed class LoopConfig
 /// <summary>
 /// Per-iteration summary pushed to an observer (console now, Spectre dashboard later).
 /// </summary>
+public readonly record struct MatchResult(int W, int D, int L)
+{
+    public double Score => W + D + L > 0 ? (W + 0.5 * D) / (W + D + L) : 0;
+    public override string ToString() => $"+{W} ={D} -{L}";
+}
 public readonly record struct IterReport(
     int Generation, int BufferPositions, bool NetTeacher,
-    double GenSec, double GamesPerSec, double TrainSec, double Mse, double? Score);
+    double GenSec, double GamesPerSec, double TrainSec, double Mse, double? Score,
+    MatchResult? VsAnchor = null, MatchResult? VsBest = null, bool Promoted = false);
 
 /// <summary>
 /// Observer hooks so the loop stays headless and a UI can subscribe.
@@ -135,18 +141,21 @@ public sealed class ContinuousLoop
 
             // 5. MEASURE + GATE
             double? score = null;
+            MatchResult? vsAnchor = null, vsBest = null;
+            bool promoted = false;
             if (generation % cfg.MeasureEvery == 0 && !ct.IsCancellationRequested)
             {
                 events.Stage?.Invoke("measuring");
                 if (!netTeacher)
                 {
-                    score = Match(trainer.Net, null, ct);                 // candidate vs hand-crafted anchor
-                    if (score >= cfg.SwitchThreshold)
+                    var anch = Match(trainer.Net, null, ct);              // candidate vs hand-crafted anchor
+                    vsAnchor = anch; score = anch.Score;
+                    if (anch.Score >= cfg.SwitchThreshold)
                     {
                         netTeacher = true;
                         bestNet = trainer.Net.Clone();
-                        bestScore = score.Value;
-                        events.Info?.Invoke($"net surpassed hand-crafted ({score:P0}) → net teacher + gating on");
+                        bestScore = anch.Score;
+                        events.Info?.Invoke($"net surpassed hand-crafted ({anch} = {anch.Score:P0}) → net teacher + gating on");
                         Save(); SaveBest();
                     }
                 }
@@ -155,18 +164,20 @@ public sealed class ContinuousLoop
                     // Net-vs-net gate: only promote the candidate (and regenerate against it) if it actually
                     // beats the reigning best head-to-head. This ratchets, so a candidate that drifts down
                     // can't demote the best or poison the self-play data.
-                    double gate = Match(trainer.Net, bestNet, ct);
-                    score = Match(trainer.Net, null, ct);                 // vs anchor, for the progress curve
-                    if (gate >= cfg.GateThreshold)
+                    var gate = Match(trainer.Net, bestNet, ct);
+                    var anch = Match(trainer.Net, null, ct);             // vs anchor, for the progress curve
+                    vsBest = gate; vsAnchor = anch; score = anch.Score;
+                    promoted = gate.Score >= cfg.GateThreshold;
+                    if (promoted)
                     {
                         bestNet = trainer.Net.Clone();
-                        bestScore = score ?? bestScore;
-                        events.Info?.Invoke($"candidate beat best ({gate:P0} h2h, {score:P0} vs anchor) → promoted");
+                        bestScore = anch.Score;
+                        events.Info?.Invoke($"candidate beat best (vs-best {gate} = {gate.Score:P0}, vs-anchor {anch}) → PROMOTED");
                         SaveBest();
                     }
                     else
                     {
-                        events.Info?.Invoke($"candidate held below best ({gate:P0} h2h) → best kept");
+                        events.Info?.Invoke($"candidate held below best (vs-best {gate} = {gate.Score:P0}) → best kept");
                     }
                 }
             }
@@ -174,7 +185,7 @@ public sealed class ContinuousLoop
             events.Iteration?.Invoke(new IterReport(
                 generation, buffer.Count, netTeacher,
                 genClock.Elapsed.TotalSeconds, cfg.GamesPerIter / Math.Max(0.001, genClock.Elapsed.TotalSeconds),
-                trainClock.Elapsed.TotalSeconds, mse, score));
+                trainClock.Elapsed.TotalSeconds, mse, score, vsAnchor, vsBest, promoted));
         }
         Save();
         SaveCorpus();   // capture the final buffer so the next run resumes with it
@@ -182,7 +193,7 @@ public sealed class ContinuousLoop
 
     /// <summary>Head-to-head match: <paramref name="a"/> vs <paramref name="b"/> (null = hand-crafted eval),
     /// alternating colours. Returns a's score in [0,1].</summary>
-    private double Match(NnueNetwork? a, NnueNetwork? b, CancellationToken ct)
+    private MatchResult Match(NnueNetwork? a, NnueNetwork? b, CancellationToken ct)
     {
         var rng = new Random(777);
         int w = 0, d = 0, l = 0;
@@ -197,8 +208,7 @@ public sealed class ContinuousLoop
             else l++;
             events.Progress?.Invoke(g + 1, cfg.MeasureGames);
         }
-        int played = w + d + l;
-        return played > 0 ? (w + 0.5 * d) / played : 0;
+        return new MatchResult(w, d, l);
     }
 
     // ---- persistence ----

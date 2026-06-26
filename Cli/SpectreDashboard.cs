@@ -51,7 +51,9 @@ public static class SpectreDashboard
     private static string Summary(IterReport r) =>
         $"gen {r.Generation,4} | buf {r.BufferPositions,9:n0} | gen {r.GenSec,5:F1}s ({r.GamesPerSec:F0} g/s) | " +
         $"train {r.TrainSec,5:F1}s | mse {r.Mse:F4}" +
-        (r.Score is double sc ? $" | vs-anchor {sc:P0}" : "") + (r.NetTeacher ? " | [net teacher]" : "");
+        (r.VsAnchor is MatchResult a ? $" | vs-anchor {a} ({a.Score:P0})" : "") +
+        (r.VsBest is MatchResult b ? $" | vs-best {b} ({b.Score:P0}){(r.Promoted ? " -> PROMOTED" : "")}" : "") +
+        (r.NetTeacher ? " | [net teacher]" : "");
 
     /// <summary>The redirected-output fallback: no cursor tricks, just print stage changes, occasional
     /// progress, and a summary line per generation. Safe to pipe to a file.</summary>
@@ -137,15 +139,26 @@ public static class SpectreDashboard
 
         rows.Add(new Rule("[grey]history[/]").RuleStyle("grey").LeftJustified());
         var table = new Table().Border(TableBorder.Minimal).BorderColor(Color.Grey);
-        table.AddColumns("[grey]gen[/]", "[grey]gen speed[/]", "[grey]train[/]", "[grey]mse[/]", "[grey]vs anchor[/]");
+        table.AddColumns("[grey]gen[/]", "[grey]gen speed[/]", "[grey]train[/]", "[grey]mse[/]", "[grey]vs anchor (W L D)[/]", "[grey]vs best (W L D)[/]");
         lock (s.History)
             foreach (var r in s.History)
-                table.AddRow(r.Generation.ToString(), $"{r.GamesPerSec:F0} g/s", $"{r.TrainSec:F1}s", $"{r.Mse:F4}",
-                             r.Score is double sc ? $"{sc:P0}" : "-");
+            {
+                if (r.VsAnchor is MatchResult a)
+                {
+                    string col = r.Promoted ? "lime" : "aqua";
+                    string best = r.VsBest is MatchResult b ? $"{Result(b)}{(r.Promoted ? " *" : "")}" : "-";
+                    table.AddRow($"[{col}]{r.Generation}[/]", $"[{col}]{r.GamesPerSec:F0} g/s[/]", $"[{col}]{r.TrainSec:F1}s[/]",
+                                 $"[{col}]{r.Mse:F4}[/]", $"[{col}]{Markup.Escape(Result(a))}[/]", $"[{col}]{Markup.Escape(best)}[/]");
+                }
+                else
+                    table.AddRow(r.Generation.ToString(), $"{r.GamesPerSec:F0} g/s", $"{r.TrainSec:F1}s", $"{r.Mse:F4}", "-", "-");
+            }
         rows.Add(table);
 
         return new Panel(new Rows(rows)).Expand().BorderColor(Color.Grey);
     }
+
+    private static string Result(MatchResult m) => $"W={m.W} L={m.L} D={m.D} ({m.Score:P0})";
 
     /// <summary>Render the "stage" line: the stage name plus, when the stage reports a total, a text
     /// progress bar and a linear ETA extrapolated from elapsed time and fraction done.</summary>
