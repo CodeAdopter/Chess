@@ -28,6 +28,7 @@ public sealed class NnueTrainer
     // when saturated, which traps any unit pinned at 0 or 1 (no gradient can move it back). A small leak
     // lets saturated units recover, the clipped-ReLU analogue of leaky ReLU.
     private const float Leak = 0.01f;
+    private const float WClip = 1.98f;
 
     public NnueNetwork Net { get; }
     public float Lr { get; set; }
@@ -164,7 +165,7 @@ public sealed class NnueTrainer
         float p = Sigmoid(r);
         float err = p - ex.Target;
 
-        long ti = System.Threading.Interlocked.Increment(ref t);
+        long ti = Interlocked.Increment(ref t);
         float bc1 = ti < 2000 ? 1f - MathF.Pow(B1, ti) : 1f;
         float bc2 = ti < 30000 ? 1f - MathF.Pow(B2, ti) : 1f;
         float gr = 2f * err * p * (1f - p);
@@ -176,12 +177,18 @@ public sealed class NnueTrainer
         {
             float da1 = gr * W2[o];
             Adam(ref W2[o], ref mW2[o], ref vW2[o], gr * a1[o], bc1, bc2);
+            W2[o] = Math.Clamp(W2[o], -WClip, WClip);
             float dz1 = (z1[o] > 0f && z1[o] < 1f) ? da1 : Leak * da1;
             if (dz1 != 0f)
             {
                 int bse = o * twoH;
                 Adam(ref b1[o], ref mb1[o], ref vb1[o], dz1, bc1, bc2);
-                for (int i = 0; i < twoH; i++) { dx[i] += dz1 * W1[bse + i]; Adam(ref W1[bse + i], ref mW1[bse + i], ref vW1[bse + i], dz1 * x[i], bc1, bc2); }
+                for (int i = 0; i < twoH; i++)
+                {
+                    dx[i] += dz1 * W1[bse + i];                            // backprop uses pre-update W1
+                    Adam(ref W1[bse + i], ref mW1[bse + i], ref vW1[bse + i], dz1 * x[i], bc1, bc2);
+                    W1[bse + i] = Math.Clamp(W1[bse + i], -WClip, WClip);
+                }
             }
         }
 
